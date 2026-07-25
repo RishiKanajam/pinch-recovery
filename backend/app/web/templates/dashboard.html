@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% set page = 'dashboard' %}
+{% block title %}Dashboard · Pinch Recovery{% endblock %}
+
+{% block content %}
+<h1>Recovery dashboard</h1>
+<p class="sub">
+  {# Parenthesised deliberately: `x * 100 | round(1)` binds the filter to 100,
+     not to the product, and renders 47.92% instead of 47.9%. #}
+  {{ (summary.recovery_rate * 100) | round(1) }}% of failed money recovered.
+  Every figure below is integer cents in the database.
+</p>
+
+<div class="stats">
+  <div class="stat risk">
+    <div class="k">At risk</div>
+    <div class="v">{{ summary.at_risk_cents | money_compact }}</div>
+    <div class="n">still in flight</div>
+  </div>
+  <div class="stat ok">
+    <div class="k">Recovered</div>
+    <div class="v">{{ summary.recovered_cents | money_compact }}</div>
+    <div class="n">failed, then succeeded</div>
+  </div>
+  <div class="stat warn">
+    <div class="k">Escalated</div>
+    <div class="v">{{ summary.escalated_cents | money_compact }}</div>
+    <div class="n">waiting on a human</div>
+  </div>
+  <div class="stat dead">
+    <div class="k">Written off</div>
+    <div class="v">{{ summary.written_off_cents | money_compact }}</div>
+    <div class="n">past the 21-day horizon</div>
+  </div>
+</div>
+<p class="sub" style="margin-top:10px;font-size:12.5px;color:var(--faint)">
+  Escalated is a subset of at-risk, not a separate bucket — a payment waiting on a
+  human is still unrecovered.
+</p>
+
+<h2>By failure class</h2>
+<div class="classes">
+  {% for c in summary.by_class %}
+  {% set pct = (c.amount_cents / max_class_cents * 100) if max_class_cents else 0 %}
+  {% set rec_pct = (c.recovered_cents / c.amount_cents * 100) if c.amount_cents else 0 %}
+  <a class="crow {% if selected_class and selected_class.value == c.failure_class.value %}selected{% endif %}"
+     href="{% if selected_class and selected_class.value == c.failure_class.value %}/{% else %}/?failure_class={{ c.failure_class.value }}{% endif %}">
+    <div class="nm">
+      {{ c.failure_class | class_label }}
+      {% if c.failure_class.value in ('invalid_account', 'authority_cancelled', 'payment_stopped') %}
+        <span class="pill hard" title="Never retried — a retry cannot succeed and incurs a fee">no retry</span>
+      {% endif %}
+    </div>
+    <div class="ct">{{ c.count }}</div>
+    <div class="bar" style="width:{{ pct | round(1) }}%">
+      <i class="rec" style="width:{{ rec_pct | round(1) }}%"></i>
+      <i class="out" style="width:{{ (100 - rec_pct) | round(1) }}%"></i>
+    </div>
+    <div class="amt"><b>{{ c.recovered_cents | money }}</b> / {{ c.amount_cents | money }}</div>
+  </a>
+  {% endfor %}
+</div>
+
+<h2>
+  Payments
+  {% if selected_class %}· {{ selected_class | class_label }}{% endif %}
+  {% if selected_status %}· {{ selected_status | status_label }}{% endif %}
+</h2>
+
+<div class="filters">
+  <a class="chip {% if not selected_status %}on{% endif %}"
+     href="/{% if selected_class %}?failure_class={{ selected_class.value }}{% endif %}">All statuses</a>
+  {% for s in statuses %}
+    {% if s.value != 'pending' and s.value != 'succeeded' %}
+    <a class="chip {% if selected_status and selected_status.value == s.value %}on{% endif %}"
+       href="/?status={{ s.value }}{% if selected_class %}&failure_class={{ selected_class.value }}{% endif %}">{{ s | status_label }}</a>
+    {% endif %}
+  {% endfor %}
+  {% if selected_class %}
+    <a class="chip" href="/{% if selected_status %}?status={{ selected_status.value }}{% endif %}">✕ {{ selected_class | class_label }}</a>
+  {% endif %}
+</div>
+
+{% if payments %}
+<table class="tbl">
+  <thead>
+    <tr>
+      <th>Customer</th>
+      <th class="r">Amount</th>
+      <th>Code</th>
+      <th>Class</th>
+      <th>Status</th>
+      <th>Why this decision</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in payments %}
+    <tr onclick="location.href='/payments/{{ p.id }}'" style="cursor:pointer">
+      <td class="who"><a href="/payments/{{ p.id }}">{{ p.customer_name }}</a></td>
+      <td class="amt r">{{ p.amount_cents | money }}</td>
+      <td><span class="code">{{ p.raw_code or '—' }}</span></td>
+      <td>{{ p.failure_class | class_label }}</td>
+      <td><span class="pill {{ p.status.value }}">{{ p.status | status_label }}</span></td>
+      <td class="why">{{ p.reasoning | truncate(96, True) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<div class="empty">No payments match this filter.</div>
+{% endif %}
+{% endblock %}

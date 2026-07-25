@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% set page = 'outbox' %}
+{% block title %}Outbox · Pinch Recovery{% endblock %}
+
+{% block head_extra %}
+<style>
+.inbox { display: grid; grid-template-columns: 340px 1fr; gap: 0; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; min-height: 540px; }
+@media (max-width: 860px) { .inbox { grid-template-columns: 1fr; } .reader { border-left: none !important; border-top: 1px solid var(--line); } }
+.list { background: var(--surface); border-right: 1px solid var(--line); overflow-y: auto; max-height: 640px; }
+.item { display: block; padding: 12px 14px; border-bottom: 1px solid var(--line); color: inherit; }
+.item:hover { background: var(--surface-2); text-decoration: none; }
+.item.on { background: var(--surface-2); box-shadow: inset 2px 0 0 var(--accent); }
+.item .r1 { display: flex; align-items: baseline; gap: 8px; }
+.item .from { font-weight: 600; font-size: 13.5px; flex: 1; }
+.item .t { color: var(--faint); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.item .subj { font-size: 13px; color: var(--muted); margin-top: 3px; }
+.item.unread .from::before {
+  content: ''; display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-right: 6px; vertical-align: middle;
+}
+.item .tags { margin-top: 5px; display: flex; gap: 5px; flex-wrap: wrap; }
+.tag { font-size: 10.5px; text-transform: uppercase; letter-spacing: .04em; color: var(--faint); border: 1px solid var(--line); padding: 1px 6px; border-radius: 4px; }
+.tag.sms { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+.tag.urgent { color: var(--risk); border-color: color-mix(in srgb, var(--risk) 35%, transparent); }
+.tag.soft { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+.reader { background: var(--bg); padding: 22px 24px; }
+.reader .subject { font-size: 19px; font-weight: 620; letter-spacing: -0.02em; margin: 0 0 6px; }
+.reader .head { color: var(--muted); font-size: 13px; padding-bottom: 14px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.reader .body { white-space: pre-wrap; font-size: 14.5px; line-height: 1.68; }
+.reader .cta { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }
+.hint { color: var(--faint); font-size: 12.5px; margin-top: 10px; }
+.nothing { display: grid; place-items: center; color: var(--muted); font-size: 14px; height: 100%; text-align: center; padding: 40px; }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Outbox</h1>
+<p class="sub">
+  Every message the engine sent, and nothing was actually delivered — no SMTP, no
+  SMS gateway. The copy changes with the failure class, which is the point: a
+  cash-flow wobble and a cancelled mandate should not read the same.
+</p>
+
+<div class="inbox">
+  <div class="list">
+    {% if messages %}
+      {% for m in messages %}
+      <a class="item {% if selected and selected.id == m.id %}on{% endif %} {% if not m.read %}unread{% endif %}"
+         href="/outbox?message={{ m.id }}">
+        <div class="r1">
+          <div class="from">{{ m.customer_name }}</div>
+          <div class="t">{{ m.sent_at.strftime('%d %b %H:%M') }}</div>
+        </div>
+        <div class="subj">{{ m.subject | truncate(52, True) }}</div>
+        <div class="tags">
+          <span class="tag {% if m.channel.value == 'sms' %}sms{% endif %}">{{ m.channel.value }}</span>
+          {% if m.tone %}<span class="tag {{ m.tone }}">{{ m.tone }}</span>{% endif %}
+          <span class="tag">{{ m.action | action_label }}</span>
+        </div>
+      </a>
+      {% endfor %}
+    {% else %}
+      <div class="nothing">Nothing sent yet.<br>Fast-forward the clock to make scheduled messages fire.</div>
+    {% endif %}
+  </div>
+
+  <div class="reader">
+    {% if selected %}
+      <h2 class="subject" style="margin-top:0">{{ selected.subject }}</h2>
+      <div class="head">
+        To <b>{{ selected.customer_name }}</b> · {{ selected.channel.value }}
+        · {{ selected.sent_at.strftime('%a %d %b %Y, %H:%M') }}Z
+        {% if selected.tone %} · {{ selected.tone }} tone{% endif %}
+        <br>
+        Re: <a href="/payments/{{ selected.payment_id }}">{{ selected.payment_id }}</a>
+      </div>
+      <div class="body">{{ selected.body }}</div>
+      {% if selected.update_link %}
+      <div class="cta">
+        <a class="btn" href="{{ selected.update_link }}">{{ 'Update your bank details' }}</a>
+        <div class="hint">
+          This is the link the customer taps. It opens the hosted, mobile-first page —
+          submitting it recovers the payment live.
+        </div>
+      </div>
+      {% endif %}
+    {% else %}
+      <div class="nothing">Select a message to read it.</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}
