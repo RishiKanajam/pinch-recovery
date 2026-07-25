@@ -18,7 +18,7 @@ I own everything that produces and records a failed payment:
 - `POST /webhooks/pinch` — ingest, idempotent on `event_id`
 - The simulator: `/sim/scenarios`, `/sim/fast-forward`, `/sim/reset`, `/sim/seed-demo`
 - Pinch API client with a mock/live switch
-- A realistic seed dataset across all seven failure classes
+- A realistic seed dataset across every failure class that can occur on a direct debit
 
 My teammate (Person B) owns the classifier, strategy engine, dashboard, and the
 update-details flow. I do NOT build those. Where our code meets, `docs/CONTRACT.md`
@@ -60,7 +60,14 @@ APScheduler for due-action polling. pytest for tests. Dependencies are pinned in
 
 ## Definition of done for my slice
 
-A single curl to `/sim/seed-demo` produces ~50 realistic failed payments across all seven
-classes; `/sim/fast-forward` collapses a three-day settlement window into seconds; a
-duplicate webhook leaves one ledger row; and my teammate can read all of it through the
-endpoints in `docs/CONTRACT.md` without asking me what a field is called.
+A single curl to `/sim/seed-demo` produces ~50 realistic failed payments across every
+failure class that can occur on a direct debit — six, not seven. `expired_card` is
+deliberately excluded: `invalid-card` and `unsupported-card` are card-scheme failures
+that cannot arise from a direct debit, so seeding one puts a class on screen that invites
+"why is there a card expiry in a direct debit product?" — a credibility question, not a
+feature. The class stays in `strategies.yaml` so the engine still demonstrates it;
+only the demo dataset omits it. See `EXCLUDED_FROM_SEED` in `app/sim/seed.py`.
+
+`/sim/fast-forward` collapses a three-day settlement window into seconds; a duplicate
+webhook leaves one ledger row; and my teammate can read all of it through the endpoints
+in `docs/CONTRACT.md` without asking me what a field is called.
