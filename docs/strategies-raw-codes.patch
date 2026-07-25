@@ -1,0 +1,88 @@
+diff --git a/backend/app/services/strategies.yaml b/backend/app/services/strategies.yaml
+index b3181e3..77f2437 100644
+--- a/backend/app/services/strategies.yaml
++++ b/backend/app/services/strategies.yaml
+@@ -2,14 +2,17 @@
+ #
+ # This is the product. Everything else is plumbing around it.
+ #
+-# `raw_codes` MUST be verified against https://docs.getpinch.com.au/docs/dishonour-codes
+-# before the live demo. The classes below are correct regardless of what the code
+-# strings turn out to be — only the mapping needs updating.
++# `raw_codes` VERIFIED against https://docs.getpinch.com.au/docs/dishonour-codes
++# on 2026-07-25. Pinch emits exactly seven codes, all hyphenated lowercase:
++#   insufficient-funds, temporary-problem, technical-error, blocked-by-bank,
++#   invalid-account, invalid-card, unsupported-card
++# Two of our classes (authority_cancelled, payment_stopped) have NO Pinch code
++# and are simulator-only — marked inline below.
+ 
+ classes:
+ 
+   insufficient_funds:
+-    raw_codes: ["AM04", "0902", "insufficient_funds", "refer_to_issuer"]
++    raw_codes: ["insufficient-funds"]
+     diagnosis: "Timing problem, not intent. The customer still wants the service."
+     max_attempts: 4
+     notify_human: false
+@@ -27,7 +30,7 @@ classes:
+       Messaging stays soft — this customer is not churning.
+ 
+   invalid_account:
+-    raw_codes: ["AC01", "AC04", "0903", "invalid_account", "account_closed"]
++    raw_codes: ["invalid-account"]
+     diagnosis: "Data problem. Retrying is guaranteed to fail and incurs a fee."
+     max_attempts: 0
+     notify_human: false
+@@ -47,7 +50,10 @@ classes:
+       to details capture, escalating channel over four days.
+ 
+   authority_cancelled:
+-    raw_codes: ["MD01", "0905", "authority_cancelled", "mandate_cancelled"]
++    # SIMULATOR-ONLY: Pinch has no dishonour code for a cancelled mandate.
++    # Emitted by our simulator so the strategy is demoable; a live dishonour
++    # will never carry it. Revisit if Pinch adds a mandate event.
++    raw_codes: ["authority-cancelled"]
+     diagnosis: "Churn signal. The customer revoked permission deliberately."
+     max_attempts: 0
+     notify_human: true
+@@ -63,7 +69,9 @@ classes:
+       save offer — pause, downgrade, or exit survey — and alert the account owner.
+ 
+   payment_stopped:
+-    raw_codes: ["MS02", "0904", "payment_stopped", "stop_payment"]
++    # SIMULATOR-ONLY: Pinch has no dishonour code for a stopped payment.
++    # See the note on authority_cancelled above.
++    raw_codes: ["payment-stopped"]
+     diagnosis: "Dispute signal. Retrying escalates to a formal complaint."
+     max_attempts: 0
+     notify_human: true
+@@ -75,7 +83,7 @@ classes:
+       risks a chargeback or complaint. Humans only.
+ 
+   technical:
+-    raw_codes: ["AG01", "0909", "processing_error", "system_unavailable", "timeout"]
++    raw_codes: ["technical-error", "temporary-problem"]
+     diagnosis: "Bank-side failure. Not the customer's fault and not their problem."
+     max_attempts: 2
+     notify_human: false
+@@ -89,7 +97,8 @@ classes:
+       happened and telling them manufactures churn out of an outage. Silent retry.
+ 
+   expired_card:
+-    raw_codes: ["54", "expired_card"]
++    # Card codes, not direct debit. Kept for card-funded subscriptions.
++    raw_codes: ["invalid-card", "unsupported-card"]
+     diagnosis: "Predictable and preventable."
+     max_attempts: 1
+     notify_human: false
+@@ -106,7 +115,9 @@ classes:
+       fix is the preventive job that warns 14 days before expiry.
+ 
+   do_not_honour:
+-    raw_codes: ["05", "do_not_honour", "generic_decline"]
++    # Pinch marks blocked-by-bank NON-retryable. The single retry below
++    # contradicts that — see OPEN QUESTION 1 in docs/pinch-codes-proposal.md.
++    raw_codes: ["blocked-by-bank"]
+     diagnosis: "Ambiguous. Issuer risk rules, limits, or something unstated."
+     max_attempts: 1
+     notify_human: false

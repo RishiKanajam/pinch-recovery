@@ -18,6 +18,7 @@ from app.models.enums import (
     PaymentStatus,
 )
 from app.models.payment import Payment
+from app.models.sim_webhook import SimulatedWebhook
 from app.models.webhook_event import WebhookEvent
 
 __all__ = [
@@ -30,5 +31,6 @@ __all__ = [
     "FailureClass",
     "Payment",
     "PaymentStatus",
+    "SimulatedWebhook",
     "WebhookEvent",
 ]
