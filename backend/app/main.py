@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from app.api.payments import router as payments_router
 from app.api.webhooks import router as webhooks_router
 from app.sim.routes import router as sim_router
 from app.core import clock
@@ -11,6 +12,7 @@ from app.core.config import settings
 
 app = FastAPI(title="Pinch Recovery Engine", version="0.1.0")
 
+app.include_router(payments_router)
 app.include_router(webhooks_router)
 app.include_router(sim_router)
 

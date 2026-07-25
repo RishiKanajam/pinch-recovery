@@ -14,7 +14,14 @@ from sqlalchemy import func, select
 
 from app.core import clock
 from app.models import Customer, Payment, WebhookEvent
-from app.sim.seed import EXCLUDED_FROM_SEED, SEED_PLAN, TOTAL_SEEDED
+from app.sim.seed import (
+    AT_RISK_CEILING_CENTS,
+    AT_RISK_FLOOR_CENTS,
+    EXCLUDED_FROM_SEED,
+    SEED_PLAN,
+    TOTAL_SEEDED,
+    strategy_raw_codes,
+)
 
 SEED_DEMO = "/api/v1/sim/seed-demo"
 
@@ -76,18 +83,32 @@ def test_every_payment_is_failed_and_unclassified(client, db_session):
     assert all(p.raw_code for p in payments)
 
 
-def test_raw_codes_come_from_the_seed_plan(client, db_session):
-    """Every raw_code must be one the classifier will recognise. A typo here
-    classifies as `unknown` and shows one strategy instead of seven."""
+def test_raw_codes_agree_with_strategies_yaml(client, db_session):
+    """The load-bearing invariant of the whole demo.
+
+    Every seeded raw_code must appear in strategies.yaml, because that file is
+    what the classifier reads. If they disagree, all 50 payments bucket to
+    `unknown` and the dashboard shows one strategy instead of six — with
+    nothing in the logs to explain it. Holds whether or not the corrected-codes
+    patch has been applied, because the seed reads the codes from that file.
+    """
     client.post(SEED_DEMO)
 
-    allowed = {code for plan in SEED_PLAN for code in plan.raw_codes}
-    codes = set(
-        db_session.execute(select(Payment.raw_code)).scalars().all()
-    )
-    assert codes <= allowed
-    # Hyphenated lowercase, as Pinch emits — not AM04/AC01.
-    assert all("-" in code and code.islower() for code in codes)
+    known = strategy_raw_codes()
+    allowed = {code for plan in SEED_PLAN for code in known[plan.failure_class]}
+    seeded = set(db_session.execute(select(Payment.raw_code)).scalars().all())
+
+    assert seeded, "no raw_codes seeded at all"
+    assert seeded <= allowed
+
+
+def test_every_seeded_class_has_codes_in_strategies_yaml():
+    """Fails loudly if a class is planned that the classifier cannot map."""
+    known = strategy_raw_codes()
+    for plan in SEED_PLAN:
+        assert known.get(plan.failure_class), (
+            f"strategies.yaml has no raw_codes for {plan.failure_class}"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -100,8 +121,8 @@ def test_amounts_are_integer_cents_and_plausible(client, db_session):
 
     amounts = db_session.execute(select(Payment.amount_cents)).scalars().all()
     assert all(isinstance(a, int) for a in amounts)
-    # $10 to $2,500 — service-business invoice territory.
-    assert all(1_000 <= a <= 250_000 for a in amounts)
+    # $49-$499: recurring service-invoice territory.
+    assert all(4_900 <= a <= 49_900 for a in amounts)
 
 
 def test_at_risk_cents_equals_the_sum_of_seeded_payments(client, db_session):
@@ -201,3 +222,32 @@ def test_card_classes_are_not_seeded(client, db_session):
     codes = set(db_session.execute(select(Payment.raw_code)).scalars().all())
     assert "invalid-card" not in codes
     assert "unsupported-card" not in codes
+
+
+def test_at_risk_total_is_demo_friendly(client, db_session):
+    """The headline number. Too small and the stakes look trivial; too large
+    and a $2k invoice appears where a service business would bill $200."""
+    body = client.post(SEED_DEMO).json()
+    assert AT_RISK_FLOOR_CENTS <= body["at_risk_cents"] <= AT_RISK_CEILING_CENTS
+
+
+def test_customer_base_looks_like_a_real_merchant(client, db_session):
+    """~500 customers, ~50 failures. A merchant where every customer failed is
+    not a recovery story, it is an outage."""
+    body = client.post(SEED_DEMO).json()
+    assert body["customers"] >= 400
+    assert body["seeded"] < body["customers"] / 5
+
+
+def test_some_customers_have_payday_history_and_some_do_not(client, db_session):
+    """Person B's payday alignment needs observed_payday_weekday populated, and
+    their fallback path needs it NULL. Both must be present."""
+    client.post(SEED_DEMO)
+
+    weekdays = (
+        db_session.execute(select(Customer.observed_payday_weekday)).scalars().all()
+    )
+    assert any(w is not None for w in weekdays)
+    assert any(w is None for w in weekdays)
+    # Thursday/Friday, per strategies.yaml default_payday_weekdays.
+    assert {3, 4} <= {w for w in weekdays if w is not None}

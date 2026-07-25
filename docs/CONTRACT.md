@@ -122,6 +122,56 @@ Base: `/api/v1`. All responses JSON. Errors use `{ "error": { "code", "message" 
 | `POST` | `/sim/fast-forward` | Advance simulated clock. Body: `{ "seconds": 259200 }`. |
 | `POST` | `/sim/reset` | Wipe to a known seeded state. Used before every demo run. |
 
+### `GET /payments`
+
+Returns a page of payments, newest failure first.
+
+```json
+{
+  "data": [ /* Payment objects, as specified in Core objects above */ ],
+  "next_cursor": "2026-07-22T04:12:00Z|pay_01HX..."
+}
+```
+
+| Query param | Default | Notes |
+|---|---|---|
+| `status` | — | Exact match on `PaymentStatus`. |
+| `failure_class` | — | Exact match on `FailureClass`. Matches nothing until the classifier has run. |
+| `limit` | `50` | Max `200`. |
+| `cursor` | — | Opaque. See below. |
+
+**Pagination is keyset, not offset.** The simulator and webhook ingest insert rows
+between requests, and an offset would silently skip or repeat rows as the set shifts
+underneath a paging dashboard.
+
+- `next_cursor` is **opaque** — echo it back as `?cursor=<value>` to get the next page.
+  Do not parse it, construct it, or rely on its internal format.
+- `next_cursor` is `null` on the last page. That, not an empty `data` array, is the
+  signal to stop.
+- A cursor this endpoint did not issue returns `400` with
+  `{ "error": { "code": "invalid_cursor", ... } }` rather than silently returning the
+  first page again, which is indistinguishable from a pagination loop.
+
+**Ordering** is two regions: payments that have failed, `failed_at` descending, then
+payments with no `failed_at` at all (a `pending` payment). `id` descending breaks ties.
+Undated rows sort **last** — Postgres sorts `NULL` first under `DESC`, which would put
+unfailed payments above real failures.
+
+**Fields owned by the engine are present from the first response, not added later.**
+On a payment that has not yet been classified, `failure_class` and `reasoning` are
+`null` and `attempts` is `[]`. They are never absent from the object.
+
+### `GET /payments/{id}`
+
+Returns a **bare Payment object** — not wrapped in `data` — matching the Core objects
+shape above, with `attempts` populated.
+
+Unknown id returns `404` in the standard error shape:
+
+```json
+{ "error": { "code": "payment_not_found", "message": "No payment pay_01HX..." } }
+```
+
 ### `GET /dashboard/summary`
 
 ```json

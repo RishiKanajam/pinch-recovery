@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 
 class PinchEventData(BaseModel):
@@ -35,3 +35,68 @@ class PinchWebhookEvent(BaseModel):
     event_type: str
     created_at: datetime | None = None
     data: PinchEventData
+
+
+# --------------------------------------------------------------------------
+# Response shapes — docs/CONTRACT.md "Core objects"
+# --------------------------------------------------------------------------
+
+
+def _z(value: datetime | None) -> str | None:
+    """Serialise as 2026-07-25T04:12:00Z, the format in the contract.
+
+    Pydantic's default emits +00:00. Same instant, different string, and the
+    contract shows Z — not worth Person B discovering the difference in a
+    string comparison.
+    """
+    if value is None:
+        return None
+    return value.isoformat().replace("+00:00", "Z")
+
+
+class AttemptOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    payment_id: str
+    action: str
+    channel: str | None
+    status: str
+    scheduled_for: datetime | None
+    executed_at: datetime | None
+    attempt_number: int
+    note: str | None
+
+    @field_serializer("scheduled_for", "executed_at")
+    def _ser(self, value: datetime | None) -> str | None:
+        return _z(value)
+
+
+class PaymentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    customer_id: str
+    # Denormalised from the customer so the dashboard need not join.
+    customer_name: str
+    amount_cents: int
+    currency: str
+    status: str
+    raw_code: str | None
+    # NULL until Person B's classifier runs. Present in the shape regardless,
+    # so their code binds against a stable field either way.
+    failure_class: str | None
+    failed_at: datetime | None
+    recovered_at: datetime | None
+    attempts: list[AttemptOut] = []
+    reasoning: str | None
+
+    @field_serializer("failed_at", "recovered_at")
+    def _ser(self, value: datetime | None) -> str | None:
+        return _z(value)
+
+
+class PaymentList(BaseModel):
+    data: list[PaymentOut]
+    # Opaque; pass back as ?cursor= for the next page. Null on the last page.
+    next_cursor: str | None = None
