@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:16
+    container_name: pinch_recovery_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pinch_recovery
+    ports:
+      - "5432:5432"
+    volumes:
+      - pinch_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `alembic upgrade head` immediately after `up -d` otherwise races the
+      # server's first-boot initialisation.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pinch_recovery"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  pinch_pgdata:

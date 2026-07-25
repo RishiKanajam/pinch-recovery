@@ -3,6 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 venv/
+# Every .env variant is secret, except the committed template.
 .env
+.env.*
+!.env.example
 *.egg-info/
 .DS_Store
