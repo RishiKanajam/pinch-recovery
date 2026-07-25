@@ -171,3 +171,70 @@ There is a lint test that greps for `utcnow` outside `clock.py` and fails the bu
 `PINCH_MODE=mock` (default) routes all outbound Pinch calls to the simulator.
 `PINCH_MODE=live` hits the real sandbox. Frontend never knows the difference.
 Build everything in mock. Switch to live once, late, deliberately.
+
+---
+
+## Ingestion-internal (Person A owns, Person B does not call)
+
+The shapes below sit entirely on the ingestion side of the seam. Person B reads
+`payments` rows through the API above and never touches these directly — they are
+documented here so the contract matches the code, not because they cross the seam.
+Added by agreement with Person B.
+
+### Inbound webhook envelope — `POST /webhooks/pinch`
+
+The event Pinch delivers when a payment's state changes. Modelled on Pinch's real
+webhook shape — **verify against the live payload before switching `PINCH_MODE=live`**;
+the mock simulator emits this exact envelope so both modes ingest identically.
+
+```json
+{
+  "event_id": "evt_01HX...",
+  "event_type": "payment.dishonoured",
+  "created_at": "2026-07-25T04:12:00Z",
+  "data": {
+    "payment_id": "pay_01HX...",
+    "customer_id": "cus_01HX...",
+    "amount_cents": 24900,
+    "currency": "AUD",
+    "dishonour_code": "AC01"
+  }
+}
+```
+
+- `event_id` is the idempotency key. Ingest inserts it into `webhook_events` first; a
+  duplicate `event_id` returns 200 and is otherwise a no-op. Same event twice = one
+  payment row.
+- `event_type` values used for the hackathon: `payment.dishonoured` (the one that
+  matters), `payment.succeeded` (marks a prior failure recovered).
+- `dishonour_code` maps to `raw_code` on the payment, then to a `FailureClass` by the
+  classifier. It must be one of the strings in `strategies.yaml` `raw_codes`, or it
+  classifies as `unknown`.
+- `# TODO verify against live webhook` — the field names inside `data` are the most
+  likely thing to differ from Pinch's real shape. This is the known checkpoint for the
+  mock→live switch.
+
+### Dev-only simulator endpoints
+
+Not called by the frontend or by Person B's code. Local development and demo control only.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/sim/seed-demo` | Reset, then create ~50 realistic failed payments across all seven failure classes. Run before a demo. Returns a per-class count + `amount_cents` summary. |
+
+`/sim/scenarios`, `/sim/fast-forward`, and `/sim/reset` are already specified in the
+main HTTP table above; `seed-demo` is grouped here because, unlike those, it is purely a
+demo-seeding convenience with no counterpart in a live deployment.
+
+**`POST /sim/seed-demo` response:**
+
+```json
+{
+  "seeded": 50,
+  "at_risk_cents": 1840000,
+  "by_class": [
+    { "failure_class": "insufficient_funds", "count": 20, "amount_cents": 760000 },
+    { "failure_class": "invalid_account", "count": 9, "amount_cents": 410000 }
+  ]
+}
+```
