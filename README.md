@@ -14,8 +14,20 @@ Pinch already tells you *why* the payment failed. This reads that reason and act
 ```bash
 # backend
 cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+
+# Python 3.12, not 3.14. The pins in requirements.txt have no 3.14 wheels —
+# psycopg-binary==3.2.3 doesn't exist for it and pydantic-core builds from
+# source. uv downloads 3.12 for you if you don't have it.
+uv venv --python 3.12 .venv
+
+# Activate. Do not skip this: `python3` on PATH is probably 3.14, and an
+# unactivated alembic/uvicorn silently runs against the wrong interpreter.
+source .venv/bin/activate
+
+# `uv pip`, not bare `pip` — uv venvs ship without pip, so plain `pip` here
+# resolves to the system 3.14 one and reinstalls into the wrong place.
+uv pip install -r requirements.txt
+
 docker compose up -d db          # postgres on 5432
 alembic upgrade head
 uvicorn app.main:app --reload    # :8000
