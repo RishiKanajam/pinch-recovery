@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.core.db import get_db
-from app.sim import service
+from app.sim import seed, service
 from app.sim.schemas import FastForwardRequest, ScenarioRequest
 
 router = APIRouter(prefix="/api/v1/sim", tags=["simulator"])
@@ -51,6 +51,16 @@ def fast_forward(
         # Reported, not executed — see service.due_attempts.
         "attempts_due": attempts,
     }
+
+
+@router.post("/seed-demo")
+def seed_demo(db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Reset, then seed ~50 realistic failures across every direct debit class.
+
+    Run this before a demo. Dev-only — see the Ingestion-internal section of
+    docs/CONTRACT.md.
+    """
+    return seed.seed_demo(db)
 
 
 @router.post("/reset", response_model=None)
