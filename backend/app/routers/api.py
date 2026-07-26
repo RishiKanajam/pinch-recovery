@@ -1,8 +1,16 @@
-"""JSON API for the endpoints docs/CONTRACT.md assigns to Person B.
+"""JSON API for the decide/act endpoints docs/CONTRACT.md assigns to Person B.
 
-Only the read/decide endpoints are here. `/webhooks/pinch` and the `/sim/*`
-family belong to Person A and are deliberately absent — see dev.py for the
-temporary stand-ins the stub store needs.
+`GET /payments` and `GET /payments/{id}` are **not** here. Both halves of the
+build implemented them — this one against the in-memory store, returning a bare
+list — and the contract specifies the paged `{"data", "next_cursor"}` shape with
+keyset pagination that `app/api/payments.py` serves off the database. Two
+routers claiming one path is not a conflict git can see: FastAPI resolves it
+silently by registration order, so whichever was mounted first would win and the
+other would simply never run. The contract-correct one wins, and this module
+keeps only the endpoints it alone owns.
+
+`/webhooks/pinch` and the `/sim/*` family belong to Person A and are likewise
+absent.
 
 Errors are shaped `{"error": {"code", "message"}}` per the contract, which is
 why this module installs its own handler rather than letting FastAPI's default
@@ -11,10 +19,11 @@ why this module installs its own handler rather than letting FastAPI's default
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
-from app.models.enums import FailureClass, PaymentStatus
+from app.core.db import get_db
 from app.models.schemas import (
     DashboardSummary,
     ErrorResponse,
@@ -23,7 +32,7 @@ from app.models.schemas import (
     PaymentMethod,
     PaymentMethodUpdate,
 )
-from app.services.store import get_store
+from app.services.repository import Repository
 
 router = APIRouter(prefix="/api/v1", tags=["recovery"])
 
@@ -54,49 +63,43 @@ def _default_code(status_code: int) -> str:
     }.get(status_code, "error")
 
 
-@router.get("/payments", response_model=list[Payment])
-def list_payments(
-    status: PaymentStatus | None = None,
-    failure_class: FailureClass | None = None,
-    limit: int = Query(default=200, ge=1, le=500),
-) -> list[Payment]:
-    return get_store().list_payments(
-        status=status, failure_class=failure_class, limit=limit
-    )
-
-
-@router.get("/payments/{payment_id}", response_model=Payment)
-def get_payment(payment_id: str) -> Payment:
-    payment = get_store().get_payment(payment_id)
-    if payment is None:
-        raise ContractError(404, "payment_not_found", f"No payment {payment_id}")
-    return payment
+def repo(db: Session = Depends(get_db)) -> Repository:
+    """One repository per request, sharing the request's session and commit."""
+    return Repository(db)
 
 
 @router.post("/payments/{payment_id}/run-recovery", response_model=Payment)
-def run_recovery(payment_id: str) -> Payment:
-    """Force the engine to classify and schedule. Idempotent by construction:
-    planning is pure and replaces the attempt list rather than appending to it.
+def run_recovery(payment_id: str, store: Repository = Depends(repo)) -> Payment:
+    """Force the engine to classify and schedule. Idempotent.
+
+    Planning is pure and already-executed attempts are preserved rather than
+    overwritten, so calling this twice leaves the same ladder and the same
+    reasoning string — see Repository.run_recovery.
     """
-    payment = get_store().run_recovery(payment_id)
+    payment = store.run_recovery(payment_id)
     if payment is None:
         raise ContractError(404, "payment_not_found", f"No payment {payment_id}")
     return payment
 
 
 @router.get("/dashboard/summary", response_model=DashboardSummary)
-def dashboard_summary() -> DashboardSummary:
-    return get_store().summary()
+def dashboard_summary(store: Repository = Depends(repo)) -> DashboardSummary:
+    return store.summary()
 
 
 @router.get("/outbox", response_model=list[OutboxMessage])
-def outbox(limit: int = Query(default=200, ge=1, le=500)) -> list[OutboxMessage]:
-    return get_store().outbox(limit=limit)
+def outbox(
+    limit: int = Query(default=200, ge=1, le=500),
+    store: Repository = Depends(repo),
+) -> list[OutboxMessage]:
+    return store.outbox(limit=limit)
 
 
 @router.get("/customers/{customer_id}/payment-method", response_model=PaymentMethod)
-def get_payment_method(customer_id: str) -> PaymentMethod:
-    method = get_store().payment_method(customer_id)
+def get_payment_method(
+    customer_id: str, store: Repository = Depends(repo)
+) -> PaymentMethod:
+    method = store.payment_method(customer_id)
     if method is None:
         raise ContractError(404, "customer_not_found", f"No customer {customer_id}")
     return method
@@ -107,11 +110,11 @@ def update_payment_method(
     customer_id: str,
     update: PaymentMethodUpdate,
     payment_id: str | None = None,
+    store: Repository = Depends(repo),
 ) -> dict:
     """Submit new details. Triggers an immediate retry of the customer's open
     failures and reports which ones recovered.
     """
-    store = get_store()
     if store.payment_method(customer_id) is None:
         raise ContractError(404, "customer_not_found", f"No customer {customer_id}")
 

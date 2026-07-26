@@ -58,6 +58,13 @@ class Settings(BaseSettings):
         "postgresql+psycopg://postgres:postgres@localhost:5432/pinch_recovery"
     )
 
+    # The due-action poller runs on a background thread with its own session,
+    # so it does not see a test's transaction or its dependency override — it
+    # would write to the development database while the suite runs. Tests turn
+    # it off; every other environment leaves it on.
+    ENABLE_POLLER: bool = True
+    POLLER_INTERVAL_SECONDS: float = 2.0
+
     @property
     def targets_live_money(self) -> bool:
         """True when PINCH_API_BASE points at the real-money environment."""

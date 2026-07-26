@@ -5,26 +5,37 @@ removes a build step, a dev proxy, and a CORS conversation from a 48-hour build.
 The update-details page in particular has to work on a phone, and a
 server-rendered form does that with no JavaScript at all — which also means it
 cannot break in the one demo moment that matters.
+
+Reads go through `Repository`, over the real tables. The clock controls at
+`/ui/*` drive Person A's simulator: they exist because these are plain HTML
+forms and `/api/v1/sim/fast-forward` takes a JSON body, which a form cannot
+post without the JavaScript this page deliberately does without.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from app.core import clock
-from app.models.enums import ActionType, AttemptStatus, FailureClass, PaymentStatus
+from app.core.db import get_db
+from app.models.enums import FailureClass, PaymentStatus
 from app.models.schemas import PaymentMethodUpdate
-from app.services.store import get_store
+from app.services.repository import Repository
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "web" / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 router = APIRouter(tags=["web"])
+
+
+def repo(db: Session = Depends(get_db)) -> Repository:
+    return Repository(db)
 
 
 def _money(cents: int) -> str:
@@ -71,9 +82,8 @@ templates.env.filters["status_label"] = _status_label
 templates.env.filters["action_label"] = _action_label
 
 
-def _base_context(request: Request) -> dict:
+def _base_context(request: Request, store: Repository) -> dict:
     """Values every page needs: the simulated clock and the unread badge."""
-    store = get_store()
     offset = clock.offset_seconds()
     return {
         "request": request,
@@ -81,15 +91,28 @@ def _base_context(request: Request) -> dict:
         "clock_offset_seconds": offset,
         "clock_offset_days": round(offset / 86400, 1),
         "clock_is_simulated": abs(offset) > 1,
-        "unread_count": len([m for m in store.outbox(limit=500) if not m.read]),
+        "unread_count": store.unread_count(),
     }
 
 
 @router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request, failure_class: str | None = None, status: str | None = None):
-    store = get_store()
-    summary = store.summary()
+def dashboard(
+    request: Request,
+    failure_class: str | None = None,
+    status: str | None = None,
+    store: Repository = Depends(repo),
+):
+    """The worklist.
 
+    Classifies anything ingest has left unclassified before rendering. Ingestion
+    records `raw_code` and deliberately stops there — deriving `failure_class` is
+    this half of the system — so without this a freshly seeded database renders
+    fifty rows of "Unclassified" and no reasoning, which is precisely the field
+    the judge is here to read.
+    """
+    store.classify_unclassified()
+
+    summary = store.summary()
     selected_class = _parse_enum(FailureClass, failure_class)
     selected_status = _parse_enum(PaymentStatus, status)
 
@@ -97,7 +120,7 @@ def dashboard(request: Request, failure_class: str | None = None, status: str | 
         status=selected_status, failure_class=selected_class, limit=200
     )
 
-    context = _base_context(request)
+    context = _base_context(request, store)
     context.update(
         {
             "summary": summary,
@@ -116,11 +139,12 @@ def dashboard(request: Request, failure_class: str | None = None, status: str | 
 
 
 @router.get("/payments/{payment_id}", response_class=HTMLResponse)
-def payment_detail(request: Request, payment_id: str):
-    store = get_store()
+def payment_detail(
+    request: Request, payment_id: str, store: Repository = Depends(repo)
+):
     payment = store.get_payment(payment_id)
     if payment is None:
-        context = _base_context(request)
+        context = _base_context(request, store)
         context["message"] = f"No payment {payment_id}"
         return templates.TemplateResponse(
             request, "not_found.html", context, status_code=404
@@ -133,7 +157,7 @@ def payment_detail(request: Request, payment_id: str):
 
         table_ = get_strategy_table()
 
-    context = _base_context(request)
+    context = _base_context(request, store)
     context.update(
         {
             "payment": payment,
@@ -154,8 +178,9 @@ def payment_detail(request: Request, payment_id: str):
 
 
 @router.get("/outbox", response_class=HTMLResponse)
-def outbox(request: Request, message: str | None = None):
-    store = get_store()
+def outbox(
+    request: Request, message: str | None = None, store: Repository = Depends(repo)
+):
     messages = store.outbox(limit=200)
     selected = None
     if message:
@@ -163,18 +188,22 @@ def outbox(request: Request, message: str | None = None):
         if selected is not None:
             store.mark_message_read(message)
 
-    context = _base_context(request)
+    context = _base_context(request, store)
     context.update({"messages": messages, "selected": selected})
     return templates.TemplateResponse(request, "outbox.html", context)
 
 
 @router.get("/update-details/{customer_id}", response_class=HTMLResponse)
-def update_details_form(request: Request, customer_id: str, payment: str | None = None):
+def update_details_form(
+    request: Request,
+    customer_id: str,
+    payment: str | None = None,
+    store: Repository = Depends(repo),
+):
     """The hosted page a customer opens from their phone."""
-    store = get_store()
     method = store.payment_method(customer_id)
     if method is None:
-        context = _base_context(request)
+        context = _base_context(request, store)
         context["message"] = f"No customer {customer_id}"
         return templates.TemplateResponse(
             request, "not_found.html", context, status_code=404
@@ -203,11 +232,11 @@ def update_details_submit(
     bsb: str = Form(...),
     account_number: str = Form(...),
     payment_id: str = Form(default=""),
+    store: Repository = Depends(repo),
 ):
-    store = get_store()
     method = store.payment_method(customer_id)
     if method is None:
-        context = _base_context(request)
+        context = _base_context(request, store)
         context["message"] = f"No customer {customer_id}"
         return templates.TemplateResponse(
             request, "not_found.html", context, status_code=404
@@ -257,6 +286,51 @@ def update_details_submit(
             "primary_payment_id": payment_id or (recovered[0].id if recovered else None),
         },
     )
+
+
+# --- clock controls for the demo ------------------------------------------
+#
+# These drive Person A's simulator rather than reimplementing it. They exist as
+# separate paths because the header buttons are plain HTML forms and the
+# contract's `/api/v1/sim/*` endpoints take JSON bodies, which a form cannot
+# post without the JavaScript this UI is built to do without. They are UI
+# plumbing over the contract, not a second copy of it — and they claim `/ui/*`
+# so they can never be mistaken for a contract path.
+
+
+@router.post("/ui/fast-forward")
+def ui_fast_forward(seconds: float = 259200, db: Session = Depends(get_db)):
+    """Advance the simulated clock, deliver what that made due, then run it.
+
+    Default is 259200s — the three-day settlement window from the contract,
+    collapsed into the length of a button press.
+    """
+    from app.sim import service
+
+    clock.fast_forward(seconds)
+    # Person A's side: hand over any webhook whose delivery time has arrived.
+    service.deliver_due(db)
+    # This side: classify anything newly ingested, then execute what is due.
+    store = Repository(db)
+    store.classify_unclassified()
+    store.execute_due()
+    return RedirectResponse("/", status_code=303)
+
+
+@router.post("/ui/reset")
+def ui_reset(db: Session = Depends(get_db)):
+    """Back to the known demo dataset: wipe, reseed, reclassify.
+
+    `seed_demo` truncates and reseeds through the real ingest path, so this
+    lands on the same state a fresh `POST /api/v1/sim/seed-demo` produces — with
+    the engine already run over it, which is what the dashboard needs to render.
+    """
+    from app.sim import seed
+
+    seed.seed_demo(db)
+    clock.reset()
+    Repository(db).classify_unclassified()
+    return RedirectResponse("/", status_code=303)
 
 
 def _friendly_error(field: str) -> str:

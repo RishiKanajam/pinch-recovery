@@ -17,6 +17,7 @@ from app.models.enums import (
     FailureClass,
     PaymentStatus,
 )
+from app.models.outbox import OutboxMessage
 from app.models.payment import Payment
 from app.models.sim_webhook import SimulatedWebhook
 from app.models.webhook_event import WebhookEvent
@@ -29,6 +30,7 @@ __all__ = [
     "Channel",
     "Customer",
     "FailureClass",
+    "OutboxMessage",
     "Payment",
     "PaymentStatus",
     "SimulatedWebhook",
