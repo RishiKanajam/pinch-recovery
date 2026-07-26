@@ -16,9 +16,16 @@ from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
-from app.core.db import get_db
-from app.main import app
-from app.models import Base
+
+# Must be off before `app` is imported: the poller starts in the lifespan, runs
+# on a background thread with its own SessionLocal, and so would write to the
+# development database — outside the test's transaction and invisible to the
+# get_db override — while assertions run against the test database.
+settings.ENABLE_POLLER = False
+
+from app.core.db import get_db  # noqa: E402
+from app.main import app  # noqa: E402
+from app.models import Base  # noqa: E402
 
 TEST_DB_NAME = "pinch_recovery_test"
 
