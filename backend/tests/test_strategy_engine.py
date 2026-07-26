@@ -62,9 +62,9 @@ def make_payment(raw_code: str, **kwargs) -> Payment:
 @pytest.mark.parametrize(
     "code,failure_class",
     [
-        ("AC01", FailureClass.INVALID_ACCOUNT),
-        ("MD01", FailureClass.AUTHORITY_CANCELLED),
-        ("MS02", FailureClass.PAYMENT_STOPPED),
+        ("invalid-account", FailureClass.INVALID_ACCOUNT),
+        ("authority-cancelled", FailureClass.AUTHORITY_CANCELLED),
+        ("payment-stopped", FailureClass.PAYMENT_STOPPED),
     ],
 )
 def test_hard_failures_schedule_zero_retries(table, code, failure_class):
@@ -82,14 +82,14 @@ def test_hard_failures_schedule_zero_retries(table, code, failure_class):
 
 def test_hard_failure_still_does_something(table):
     """Zero retries must not mean zero action, or the payment is just abandoned."""
-    result = plan(make_payment("AC01"), table=table)
+    result = plan(make_payment("invalid-account"), table=table)
     actions = {a.action for a in result.scheduled_attempts}
     assert ActionType.REQUEST_DETAILS_UPDATE in actions
     assert ActionType.NOTIFY_HUMAN in actions
 
 
 def test_soft_failure_does_retry(table):
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     assert result.failure_class is FailureClass.INSUFFICIENT_FUNDS
     assert result.retry_count > 0
 
@@ -98,13 +98,13 @@ def test_soft_failure_does_retry(table):
 
 
 def test_retries_are_capped_by_max_attempts(table):
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     strategy = table.strategy_for(FailureClass.INSUFFICIENT_FUNDS)
     assert result.retry_count <= strategy.max_attempts
 
 
 def test_technical_retries_twice_and_stays_silent(table):
-    result = plan(make_payment("AG01"), table=table)
+    result = plan(make_payment("technical-error"), table=table)
     retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
     assert len(retries) == 2
     assert all("silent" in (a.note or "").lower() for a in retries)
@@ -117,7 +117,7 @@ def test_technical_retries_twice_and_stays_silent(table):
 
 
 def test_expired_card_retries_once_then_asks_for_details(table):
-    result = plan(make_payment("54"), table=table)
+    result = plan(make_payment("invalid-card"), table=table)
     assert result.retry_count == 1
     assert ActionType.REQUEST_DETAILS_UPDATE in {
         a.action for a in result.scheduled_attempts
@@ -151,7 +151,7 @@ def test_next_payday_with_no_weekdays_returns_input():
 def test_observed_payday_beats_the_default(table):
     """A customer paid on Tuesday should not be retried on Thursday."""
     customer = CustomerContext(customer_id="cus_01HX0001", payday_weekday=1)
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
     assert retries
     for attempt in retries:
@@ -161,7 +161,7 @@ def test_observed_payday_beats_the_default(table):
 
 def test_default_payday_used_without_history(table):
     customer = CustomerContext(customer_id="cus_01HX0001", payday_weekday=None)
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
     for attempt in retries:
         assert attempt.scheduled_for.astimezone(AEST).weekday() in (3, 4)
@@ -175,7 +175,7 @@ def test_aligned_retries_land_on_successive_paydays_not_adjacent_days(table):
     after — two retries 24h apart, which is exactly the blind-retry behaviour
     this product exists to replace. Repeats chain off the previous retry.
     """
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     retries = sorted(
         (a for a in result.scheduled_attempts if a.action is ActionType.RETRY),
         key=lambda a: a.scheduled_for,
@@ -191,7 +191,7 @@ def test_aligned_retries_land_on_successive_paydays_not_adjacent_days(table):
 
 def test_unaligned_retry_is_not_moved_to_a_payday(table):
     """technical has align_to_payday: false — it must fire on the fixed interval."""
-    result = plan(make_payment("AG01"), table=table)
+    result = plan(make_payment("technical-error"), table=table)
     first = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY][0]
     assert first.scheduled_for == FROZEN + timedelta(hours=24)
 
@@ -205,7 +205,7 @@ def test_retry_budget_exhaustion_suppresses_retries(table):
         customer_id="cus_01HX0001",
         retries_in_window=rules.customer_max_retries_in_window,
     )
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     assert result.retry_count == 0
     skipped = result.skipped_attempts
     assert skipped, "an exhausted budget should leave a visible skipped attempt"
@@ -219,7 +219,7 @@ def test_partial_retry_budget_limits_but_does_not_zero_retries(table):
         customer_id="cus_01HX0001",
         retries_in_window=rules.customer_max_retries_in_window - 1,
     )
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     assert result.retry_count == 1
 
 
@@ -230,7 +230,7 @@ def test_message_cap_delays_rather_than_drops(table):
     customer = CustomerContext(
         customer_id="cus_01HX0001", last_message_at=just_messaged
     )
-    result = plan(make_payment("AC01"), customer=customer, table=table)
+    result = plan(make_payment("invalid-account"), customer=customer, table=table)
     messages = [
         a
         for a in result.scheduled_attempts
@@ -247,7 +247,7 @@ def test_message_cap_delays_rather_than_drops(table):
 def test_messages_respect_the_cap_between_each_other(table):
     """invalid_account sends email then SMS; they must not bunch up."""
     rules = table.global_rules
-    result = plan(make_payment("AC01"), table=table)
+    result = plan(make_payment("invalid-account"), table=table)
     messages = sorted(
         (
             a
@@ -264,7 +264,7 @@ def test_messages_respect_the_cap_between_each_other(table):
 
 def test_write_off_is_always_scheduled(table):
     rules = table.global_rules
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     write_offs = [
         a for a in result.attempts if a.action is ActionType.WRITE_OFF
     ]
@@ -278,14 +278,14 @@ def test_write_off_horizon_measured_from_failure_not_now(table):
     """Re-running recovery on an old payment must not extend its life."""
     rules = table.global_rules
     failed_long_ago = FROZEN - timedelta(days=10)
-    result = plan(make_payment("AM04", failed_at=failed_long_ago), table=table)
+    result = plan(make_payment("insufficient-funds", failed_at=failed_long_ago), table=table)
     assert result.write_off_at == failed_long_ago + timedelta(
         days=rules.write_off_after_days
     )
 
 
 def test_nothing_is_scheduled_past_the_write_off_horizon(table):
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     for attempt in result.scheduled_attempts:
         if attempt.action is ActionType.WRITE_OFF:
             continue
@@ -295,7 +295,7 @@ def test_nothing_is_scheduled_past_the_write_off_horizon(table):
 def test_actions_beyond_horizon_are_skipped_with_a_reason(table):
     """A payment that failed 20 days ago has almost no runway left."""
     nearly_expired = FROZEN - timedelta(days=20, hours=12)
-    result = plan(make_payment("AM04", failed_at=nearly_expired), table=table)
+    result = plan(make_payment("insufficient-funds", failed_at=nearly_expired), table=table)
     skipped = [a for a in result.skipped_attempts]
     assert skipped
     assert all(a.note for a in skipped)
@@ -306,7 +306,7 @@ def test_actions_beyond_horizon_are_skipped_with_a_reason(table):
 
 
 def test_attempts_are_ordered_and_numbered_for_display(table):
-    result = plan(make_payment("AC01"), table=table)
+    result = plan(make_payment("invalid-account"), table=table)
     numbers = [a.attempt_number for a in result.attempts]
     assert numbers == list(range(1, len(result.attempts) + 1))
     scheduled = [a for a in result.attempts if a.scheduled_for is not None]
@@ -315,21 +315,21 @@ def test_attempts_are_ordered_and_numbered_for_display(table):
 
 
 def test_attempt_ids_are_unique(table):
-    result = plan(make_payment("AC01"), table=table)
+    result = plan(make_payment("invalid-account"), table=table)
     ids = [a.id for a in result.attempts]
     assert len(ids) == len(set(ids))
 
 
 def test_every_attempt_has_a_note(table):
     """The drill-down renders these; a blank note is a blank row."""
-    for code in ["AM04", "AC01", "MD01", "MS02", "AG01", "54", "05", "ZZ99"]:
+    for code in ["insufficient-funds", "invalid-account", "authority-cancelled", "payment-stopped", "technical-error", "invalid-card", "blocked-by-bank", "ZZ99"]:
         result = plan(make_payment(code), table=table)
         for attempt in result.attempts:
             assert (attempt.note or "").strip(), f"{code} attempt {attempt.id} has no note"
 
 
 def test_decision_trace_is_populated_for_every_class(table):
-    for code in ["AM04", "AC01", "MD01", "MS02", "AG01", "54", "05", "ZZ99"]:
+    for code in ["insufficient-funds", "invalid-account", "authority-cancelled", "payment-stopped", "technical-error", "invalid-card", "blocked-by-bank", "ZZ99"]:
         result = plan(make_payment(code), table=table)
         assert result.decision_trace
         assert all(line.strip() for line in result.decision_trace)
@@ -350,7 +350,7 @@ def test_missing_raw_code_does_not_crash(table):
 
 
 def test_plan_does_not_mutate_the_input_payment(table):
-    payment = make_payment("AM04")
+    payment = make_payment("insufficient-funds")
     plan(payment, table=table)
     assert payment.attempts == []
     assert payment.reasoning is None
@@ -358,7 +358,7 @@ def test_plan_does_not_mutate_the_input_payment(table):
 
 
 def test_apply_plan_attaches_output_without_mutating(table):
-    payment = make_payment("AM04", status=PaymentStatus.PENDING)
+    payment = make_payment("insufficient-funds", status=PaymentStatus.PENDING)
     result = plan(payment, table=table)
     updated = apply_plan(payment, result)
 
@@ -371,7 +371,7 @@ def test_apply_plan_attaches_output_without_mutating(table):
 
 
 def test_apply_plan_does_not_resurrect_terminal_status(table):
-    payment = make_payment("AM04", status=PaymentStatus.RECOVERED)
+    payment = make_payment("insufficient-funds", status=PaymentStatus.RECOVERED)
     updated = apply_plan(payment, plan(payment, table=table))
     assert updated.status is PaymentStatus.RECOVERED
 
@@ -380,7 +380,7 @@ def test_apply_plan_does_not_resurrect_terminal_status(table):
 
 
 def test_due_attempts_respects_the_simulated_clock(table):
-    payment = make_payment("AM04")
+    payment = make_payment("insufficient-funds")
     result = plan(payment, table=table)
     payment = apply_plan(payment, result)
 
@@ -401,7 +401,7 @@ def test_due_attempts_respects_the_simulated_clock(table):
 
 
 def test_due_attempts_ignores_skipped_and_executed(table):
-    payment = make_payment("AM04")
+    payment = make_payment("insufficient-funds")
     payment = apply_plan(payment, plan(payment, table=table))
     for attempt in payment.attempts:
         attempt.status = AttemptStatus.SKIPPED
@@ -410,7 +410,7 @@ def test_due_attempts_ignores_skipped_and_executed(table):
 
 
 def test_due_attempts_are_sorted_oldest_first(table):
-    payment = make_payment("AC01")
+    payment = make_payment("invalid-account")
     payment = apply_plan(payment, plan(payment, table=table))
     clock.fast_forward(seconds=60 * 60 * 24 * 60)
     due = due_attempts([payment])
