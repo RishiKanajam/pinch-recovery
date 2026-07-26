@@ -46,7 +46,7 @@ def fast_forward(
 
     return {
         "clock_offset_seconds": clock.offset_seconds(),
-        "now": clock.now().isoformat().replace("+00:00", "Z"),
+        "now": clock.to_iso_z(clock.now()),
         "webhooks_delivered": delivered,
         # Reported, not executed — see service.due_attempts.
         "attempts_due": attempts,

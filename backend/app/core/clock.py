@@ -60,3 +60,16 @@ def offset_seconds() -> float:
     """How far ahead of real time we currently are. Surfaced in the UI."""
     with _lock:
         return _offset.total_seconds()
+
+
+def to_iso_z(value: datetime | None) -> str | None:
+    """Serialise as 2026-07-25T04:12:00Z, the wire format docs/CONTRACT.md specifies.
+
+    A tz-aware datetime read back from Postgres carries whatever offset the
+    session's TimeZone setting is (not necessarily +00:00) even though the
+    stored instant is correct — same moment, different string. Normalise to
+    UTC before formatting so the "Z" suffix is never a lie.
+    """
+    if value is None:
+        return None
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")

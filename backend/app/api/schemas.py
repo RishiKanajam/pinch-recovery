@@ -11,6 +11,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
+from app.core.clock import to_iso_z
+
 
 class PinchEventData(BaseModel):
     # Unknown fields are kept rather than rejected: Pinch adding a field must
@@ -42,16 +44,7 @@ class PinchWebhookEvent(BaseModel):
 # --------------------------------------------------------------------------
 
 
-def _z(value: datetime | None) -> str | None:
-    """Serialise as 2026-07-25T04:12:00Z, the format in the contract.
-
-    Pydantic's default emits +00:00. Same instant, different string, and the
-    contract shows Z — not worth Person B discovering the difference in a
-    string comparison.
-    """
-    if value is None:
-        return None
-    return value.isoformat().replace("+00:00", "Z")
+_z = to_iso_z
 
 
 class AttemptOut(BaseModel):

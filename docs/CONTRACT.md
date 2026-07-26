@@ -270,7 +270,7 @@ Not called by the frontend or by Person B's code. Local development and demo con
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/sim/seed-demo` | Reset, then create ~50 realistic failed payments across all seven failure classes. Run before a demo. Returns a per-class count + `amount_cents` summary. |
+| `POST` | `/sim/seed-demo` | Reset, then create ~50 realistic failed payments across six of the seven failure classes (`expired_card` excluded — see `EXCLUDED_FROM_SEED` in `app/sim/seed.py`). Run before a demo. Returns a per-class count + `amount_cents` summary. |
 
 `/sim/scenarios`, `/sim/fast-forward`, and `/sim/reset` are already specified in the
 main HTTP table above; `seed-demo` is grouped here because, unlike those, it is purely a

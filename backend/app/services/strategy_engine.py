@@ -37,7 +37,7 @@ from app.models.enums import (
     FailureClass,
     PaymentStatus,
 )
-from app.models.schemas import Attempt, Payment, Strategy, StrategyAction
+from app.models.schemas import Attempt, Payment, Strategy
 from app.services.classifier import GlobalRules, StrategyTable, get_strategy_table
 from app.services.scheduler import hours_from, next_payday
 

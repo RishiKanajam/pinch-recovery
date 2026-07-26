@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.api.webhooks import ingest_pinch_webhook
 from app.core import clock
+from app.core.clock import to_iso_z
 from app.core.ids import new_id
 from app.models import Attempt, Base, Customer, SimulatedWebhook
 
@@ -39,7 +40,7 @@ def _build_envelope(
     return {
         "event_id": event_id,
         "event_type": event_type,
-        "created_at": created_at.isoformat().replace("+00:00", "Z"),
+        "created_at": to_iso_z(created_at),
         "data": {
             "payment_id": payment_id,
             "customer_id": customer_id,
@@ -101,7 +102,7 @@ def create_scenario(db: Session, req) -> dict[str, Any]:
         "payment_id": payment_id,
         "customer_id": customer_id,
         "event_id": event_id,
-        "scheduled_for": deliver_at.isoformat().replace("+00:00", "Z"),
+        "scheduled_for": to_iso_z(deliver_at),
         "webhook_deliveries": req.webhook_deliveries,
         "delivered": False,
     }
@@ -187,7 +188,7 @@ def due_attempts(db: Session) -> list[dict[str, Any]]:
             "attempt_id": a.id,
             "payment_id": a.payment_id,
             "action": a.action,
-            "scheduled_for": a.scheduled_for.isoformat().replace("+00:00", "Z"),
+            "scheduled_for": to_iso_z(a.scheduled_for),
         }
         for a in rows
     ]

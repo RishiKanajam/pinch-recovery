@@ -31,12 +31,11 @@ uv pip install -r requirements.txt
 docker compose up -d db          # postgres on 5432
 alembic upgrade head
 uvicorn app.main:app --reload    # :8000
-
-# frontend
-cd frontend
-npm install
-npm run dev                      # :3000
 ```
+
+There is no separate frontend build. The dashboard is server-rendered — FastAPI serves
+Jinja2 templates from `app/web/templates` on the same `:8000` process as the API. Open
+`http://localhost:8000/` once the server is up.
 
 Default mode is `PINCH_MODE=mock` — no Pinch credentials needed to develop.
 
@@ -75,7 +74,6 @@ on demand, with a compressible settlement delay.
 |---|---|
 | `docs/CONTRACT.md` | **Read first.** API shapes, enums, money rules. The interface both halves build against. |
 | `backend/app/services/strategies.yaml` | The recovery strategy table. This is the product. |
-| `docs/DEMO.md` | The five-minute demo script, step by step. |
 
 ---
 
@@ -105,8 +103,9 @@ seam — agree changes to it, don't make them unilaterally.
 - `POST /webhooks/pinch` with idempotency on `event_id`
 - The simulator: `/sim/scenarios`, `/sim/fast-forward`, `/sim/reset`, `/sim/seed-demo`
 - Pinch API client with mock/live switch
-- Seed dataset — ~50 payments across all seven failure classes, realistic AU service
-  business names and amounts
+- Seed dataset — ~50 payments across six of the seven failure classes (`expired_card`
+  excluded — a card-scheme failure that can't arise from a direct debit), realistic AU
+  service business names and amounts
 - Tests: duplicate delivery, clock discipline, seed determinism
 
 **Done when:** a single curl produces a realistic dishonour, and fast-forward makes a
