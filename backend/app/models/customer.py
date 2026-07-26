@@ -36,6 +36,13 @@ class Customer(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Pinch's own ids, populated only in PINCH_MODE=live. A payer is created
+    # (or looked up) the first time we call update_payment_method for this
+    # customer; a retry needs pinch_payer_id to know who to re-present against.
+    # NULL in mock mode — the mock never opens a socket to Pinch.
+    pinch_payer_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    pinch_source_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
     # Monday=0 .. Sunday=6, matching strategies.yaml default_payday_weekdays.
     # NULL means "no observed history" and the engine falls back to defaults.
     observed_payday_weekday: Mapped[int | None] = mapped_column(Integer, nullable=True)

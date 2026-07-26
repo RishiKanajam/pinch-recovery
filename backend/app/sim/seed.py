@@ -33,7 +33,7 @@ from sqlalchemy.orm import Session
 
 from app.core import clock
 from app.models import Customer, Payment, SimulatedWebhook
-from app.sim.service import _build_envelope, deliver_due, reset_all
+from app.sim.service import STATUS_FOR_OUTCOME, _build_envelope, deliver_due, reset_all
 
 # Bumping this changes the whole dataset. Don't, mid-rehearsal.
 SEED = 20260725
@@ -274,10 +274,10 @@ def seed_demo(db: Session) -> dict[str, Any]:
 
         envelope = _build_envelope(
             event_id=event_id,
-            event_type="payment.dishonoured",
             payment_id=payment_id,
             customer_id=customer.id,
             amount_cents=amount_cents,
+            status=STATUS_FOR_OUTCOME["dishonour"],
             raw_code=raw_code,
             created_at=now - timedelta(seconds=age_seconds),
         )

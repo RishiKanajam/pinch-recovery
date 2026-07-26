@@ -99,6 +99,20 @@ class Repository:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    def _pinch_client(self):
+        """The Pinch boundary, bound to this repository's database.
+
+        The mock resolves against local tables, so it is handed a factory on the
+        same bind as this session — left to its own SessionLocal it would settle
+        a test's retries against the development database.
+        """
+        from sqlalchemy.orm import Session as _Session
+
+        from app.services.pinch_client import get_pinch_client
+
+        bind = self.db.get_bind()
+        return get_pinch_client(session_factory=lambda: _Session(bind=bind))
+
     # --- row -> contract shape -------------------------------------------
 
     @staticmethod
@@ -443,13 +457,24 @@ class Repository:
                 continue
 
             if attempt_row.action == ActionType.RETRY.value:
-                # A retry against unchanged details fails again — that is the
-                # whole point of the hard-failure rule. Recovery in the demo
-                # comes from the customer updating details, not from luck.
-                attempt_row.status = AttemptStatus.FAILED.value
-                attempt_row.note = (
-                    attempt_row.note or ""
-                ) + " Retry presented and failed again."
+                # Present the debit through the Pinch boundary and stop there.
+                # A retry does not resolve when it is submitted: the bank
+                # answers days later, Pinch reports that answer to
+                # /webhooks/pinch, and that is what moves the payment to
+                # `recovered`. Deciding the outcome here instead would be the
+                # engine marking its own homework, and would leave the ingest
+                # path that has to record real recoveries permanently unused.
+                result = self._pinch_client().retry_payment(payment_row.id)
+                if result.accepted:
+                    attempt_row.status = AttemptStatus.EXECUTED.value
+                    attempt_row.note = (
+                        attempt_row.note or ""
+                    ) + " Re-presented via Pinch; awaiting settlement."
+                else:
+                    attempt_row.status = AttemptStatus.FAILED.value
+                    attempt_row.note = (
+                        attempt_row.note or ""
+                    ) + f" Pinch refused the retry: {result.message}"
                 continue
 
             attempt_row.status = AttemptStatus.EXECUTED.value

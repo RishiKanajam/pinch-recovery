@@ -103,6 +103,123 @@ class PinchClient(ABC):
 # --------------------------------------------------------------------------
 
 
+# How often a re-presented debit clears, by the class of the original failure.
+# Two figures each: when the account is likely to hold funds, and when it is
+# not. The gap between the columns is what makes payday alignment worth doing —
+# an engine that retries on the customer's payday earns the left-hand number,
+# one that retries blindly earns the right.
+#
+# The hard classes are absent deliberately. A closed account, a revoked
+# mandate, and a stopped payment never clear on re-presentation no matter when
+# you try, which is why the strategy table schedules zero retries for them —
+# see README "Non-negotiables" rule 5. Anything not listed here clears never.
+_CLEARS_IN_FUNDS = {
+    "insufficient_funds": 0.85,
+    "temporary_problem": 0.75,
+    "technical": 0.80,
+    # A bank refusal without a stated reason. Sometimes a soft decline that
+    # clears later, more often something the customer has to resolve.
+    "do_not_honour": 0.30,
+}
+_CLEARS_OUT_OF_FUNDS = {
+    "insufficient_funds": 0.20,
+    "temporary_problem": 0.55,
+    # A transient fault on Pinch's or the bank's side has nothing to do with
+    # the customer's balance, so timing barely moves it.
+    "technical": 0.75,
+    "do_not_honour": 0.15,
+}
+
+# Funds are assumed present on the customer's payday and the two days after it.
+_FUNDS_WINDOW_DAYS = 3
+
+
+def _unit_interval(*parts: object) -> float:
+    """A stable pseudo-random float in [0, 1) from the given parts.
+
+    sha256 rather than hash(): PYTHONHASHSEED randomises str hashing per
+    process, which would make two runs of the same seeded demo diverge. The
+    README requires /sim/reset to reproduce the same dashboard, so the outcome
+    of a given presentation has to be a pure function of its inputs.
+    """
+    import hashlib
+
+    key = "|".join(str(p) for p in parts).encode()
+    return int.from_bytes(hashlib.sha256(key).digest()[:8], "big") / 2**64
+
+
+def _executed_retry_count(session: Session, payment_id: str) -> int:
+    """Retries already presented for this payment."""
+    from sqlalchemy import func, select as sa_select
+
+    from app.models.attempt import Attempt
+
+    return int(
+        session.execute(
+            sa_select(func.count())
+            .select_from(Attempt)
+            .where(
+                Attempt.payment_id == payment_id,
+                Attempt.action == "retry",
+                Attempt.executed_at.is_not(None),
+            )
+        ).scalar_one()
+    )
+
+
+def _payday_weekday(customer: Customer | None) -> int:
+    """The weekday this customer is paid, Mon=0.
+
+    Falls back to a stable per-customer weekday rather than a fixed default:
+    every customer sharing one payday would make the engine's alignment look
+    better than it is, because a single well-timed retry would clear the whole
+    book at once.
+    """
+    if customer is None:
+        return 3
+    if customer.observed_payday_weekday is not None:
+        return int(customer.observed_payday_weekday)
+    return int(_unit_interval("payday", customer.id) * 7)
+
+
+def _has_funds(customer: Customer | None, at: datetime) -> bool:
+    """Whether the account is likely to hold funds on `at`."""
+    days_since_payday = (at.weekday() - _payday_weekday(customer)) % 7
+    return days_since_payday < _FUNDS_WINDOW_DAYS
+
+
+def _presentation_clears(
+    *,
+    payment_id: str,
+    failure_class: str | None,
+    attempt_number: int,
+    customer: Customer | None,
+    at: datetime,
+) -> bool:
+    """Decide whether a re-presented debit clears. Deterministic.
+
+    `failure_class` is read rather than `raw_code` because the mapping from
+    Pinch's code to our class already exists and this only needs the coarse
+    behaviour. An unclassified payment clears never — the engine has not
+    decided anything about it yet, so a retry here would be a coin toss
+    dressed up as a decision.
+    """
+    if failure_class is None:
+        return False
+
+    table = _CLEARS_IN_FUNDS if _has_funds(customer, at) else _CLEARS_OUT_OF_FUNDS
+    probability = table.get(failure_class, 0.0)
+    if probability <= 0.0:
+        return False
+
+    # Later presentations against the same unchanged cause are less likely to
+    # clear, so a four-retry ladder does not read as four independent coin
+    # flips at the same odds.
+    probability *= 0.8 ** max(attempt_number, 0)
+
+    return _unit_interval("clears", payment_id, attempt_number) < probability
+
+
 class MockPinchClient(PinchClient):
     """Resolves against local database state. Never opens a socket.
 
@@ -142,10 +259,32 @@ class MockPinchClient(PinchClient):
                     message="Payment already recovered; retry refused.",
                 )
 
-        # TODO(simulator): schedule the settlement webhook here once
-        # /sim/scenarios lands, so a retry produces a real dishonour or
-        # success after the (fast-forwardable) settlement window. Until then
-        # the instruction is accepted and nothing settles.
+        # Stand in for the bank: decide whether this presentation clears, then
+        # queue the settlement webhook that reports it. The caller never learns
+        # the answer here — it arrives at /webhooks/pinch after the
+        # (fast-forwardable) settlement window, exactly as in production.
+        from app.sim.service import schedule_settlement
+
+        with self._session_factory() as session:
+            payment = session.get(Payment, payment_id)
+            customer = session.get(Customer, payment.customer_id)
+            succeeded = _presentation_clears(
+                payment_id=payment_id,
+                failure_class=payment.failure_class,
+                attempt_number=_executed_retry_count(session, payment_id),
+                customer=customer,
+                at=clock.now(),
+            )
+            schedule_settlement(
+                session,
+                payment_id=payment_id,
+                customer_id=payment.customer_id,
+                amount_cents=payment.amount_cents,
+                succeeded=succeeded,
+                raw_code=payment.raw_code,
+            )
+            session.commit()
+
         return RetryResult(
             payment_id=payment_id,
             accepted=True,
@@ -220,6 +359,7 @@ class LivePinchClient(PinchClient):
         secret_key: str | None = None,
         pinch_version: str | None = None,
         timeout: float = 10.0,
+        session_factory: Callable[[], Session] = SessionLocal,
     ) -> None:
         # `is not None`, not `or`: an explicitly-passed empty string means
         # "no credential", and must not silently fall back to the configured
@@ -241,6 +381,11 @@ class LivePinchClient(PinchClient):
             pinch_version if pinch_version is not None else settings.PINCH_VERSION
         )
         self._timeout = timeout
+        # Only for looking up/caching pinch_payer_id, pinch_source_id, and
+        # pinch_payment_id locally. Every actual payment decision — did the
+        # retry clear, did the source verify — comes from Pinch over the
+        # socket below, never from this session.
+        self._session_factory = session_factory
         self._client: httpx.Client | None = None
         self._token: str | None = None
         self._token_expires_at: datetime | None = None
@@ -270,7 +415,10 @@ class LivePinchClient(PinchClient):
         response = httpx.post(
             f"{self.auth_base}/connect/token",
             auth=httpx.BasicAuth(self.application_id, self.secret_key),
-            data={"grant_type": "client_credentials"},
+            # `scope` is required — Pinch's token endpoint 400s without it.
+            # Also form-data, not JSON: the docs are explicit that a JSON body
+            # here is silently rejected.
+            data={"grant_type": "client_credentials", "scope": "api1"},
             timeout=self._timeout,
         )
         response.raise_for_status()
@@ -324,31 +472,169 @@ class LivePinchClient(PinchClient):
         self._token_expires_at = None
 
     def retry_payment(self, payment_id: str) -> RetryResult:
-        # Auth and transport above are ready; only the request body is unknown.
-        # Filling this in is a one-line `self._request("POST", ...)` call.
-        raise NotImplementedError(
-            "LivePinchClient.retry_payment is not wired yet.\n"
-            "TODO(live): confirm the payment re-present endpoint and body at\n"
-            f"{PINCH_DOCS}/docs/direct-debit-payments — Pinch's vocabulary is\n"
-            "Payers/Sources/Payments, so a 'retry' is most likely a new payment\n"
-            "against the same source rather than a retry endpoint.\n"
-            "Map onto RetryResult(accepted=..., status='pending'). A 200 means\n"
-            "the instruction was accepted, NOT that the money moved — the\n"
-            "dishonour or success arrives later by webhook."
+        """Re-present a failed debit as a new Pinch payment.
+
+        Verified against https://docs.getpinch.com.au/reference/save-payment
+        on 2026-07-26. Pinch has no "retry" endpoint — a retry is a fresh
+        `POST /payments` against the same payer (and source, if we have one),
+        scheduled for the next business day. A 200/201 means Pinch accepted
+        the instruction, NOT that the money moved: the dishonour or success
+        for *this* presentation arrives later on a `bank-results` webhook,
+        matched back to this local row via `pinch_payment_id`.
+        """
+        with self._session_factory() as session:
+            payment = session.get(Payment, payment_id)
+
+            if payment is None:
+                return RetryResult(
+                    payment_id=payment_id,
+                    accepted=False,
+                    status="rejected",
+                    error_code="payment_not_found",
+                    message=f"No payment {payment_id}.",
+                )
+
+            if payment.status == "recovered":
+                return RetryResult(
+                    payment_id=payment_id,
+                    accepted=False,
+                    status="rejected",
+                    error_code="already_recovered",
+                    message="Payment already recovered; retry refused.",
+                )
+
+            customer = session.get(Customer, payment.customer_id)
+            if customer is None or not customer.pinch_payer_id:
+                # No Payer to charge — update_payment_method creates one.
+                # Guessing an id here would silently retry against nothing.
+                return RetryResult(
+                    payment_id=payment_id,
+                    accepted=False,
+                    status="rejected",
+                    error_code="no_pinch_payer",
+                    message=(
+                        "Customer has no Pinch payer id yet; "
+                        "update_payment_method must run before the first retry."
+                    ),
+                )
+
+            # Distinguishes each successive retry so a network-level retry of
+            # *this* HTTP call reuses the same nonce (Pinch dedupes on it),
+            # while the next scheduled retry gets a new one and is not
+            # mistaken for a replay.
+            attempt_number = _executed_retry_count(session, payment_id)
+            body: dict[str, Any] = {
+                "payerId": customer.pinch_payer_id,
+                "amount": payment.amount_cents,
+                # Direct debit re-presentations settle overnight regardless
+                # of when submitted, so next-business-day is the earliest
+                # meaningful date; Pinch's own processing schedule handles
+                # weekends.
+                "transactionDate": (clock.now().date() + timedelta(days=1)).isoformat(),
+                "description": f"Retry of {payment.id}",
+                "nonce": [f"{payment.id}:retry:{attempt_number}"],
+            }
+            if customer.pinch_source_id:
+                body["sourceId"] = customer.pinch_source_id
+
+            try:
+                response = self._request("POST", "/payments", json=body)
+            except httpx.HTTPStatusError as exc:
+                return RetryResult(
+                    payment_id=payment_id,
+                    accepted=False,
+                    status="rejected",
+                    error_code=f"http_{exc.response.status_code}",
+                    message=exc.response.text,
+                )
+
+            pinch_payment = response.json()
+            # Overwritten, not appended: this local row tracks the most
+            # recent presentation, so the next bank-results webhook resolves
+            # back to it (see Payment.pinch_payment_id).
+            payment.pinch_payment_id = pinch_payment.get("id")
+            session.commit()
+
+        return RetryResult(
+            payment_id=payment_id,
+            accepted=True,
+            status="pending",
+            message="Retry accepted; awaiting settlement webhook.",
         )
 
     def update_payment_method(
         self, customer_id: str, details: dict[str, Any]
     ) -> PaymentMethodResult:
-        raise NotImplementedError(
-            "LivePinchClient.update_payment_method is not wired yet.\n"
-            "TODO(live): confirm the payer/source endpoint at\n"
-            f"{PINCH_DOCS}/docs/pinch-payments-api-core-concepts — bank details\n"
-            "are a 'Source' attached to a 'Payer'.\n"
-            "Preferred flow: the browser tokenises via CaptureJS with\n"
-            "PINCH_PUBLISHABLE_KEY and posts us a token, so the raw account\n"
-            "number never reaches our server. Persist only the last four\n"
-            "digits locally, as MockPinchClient does."
+        """Replace a customer's bank details in Pinch.
+
+        Verified against https://docs.getpinch.com.au/reference/save-payer
+        and https://docs.getpinch.com.au/reference/create-payment-source on
+        2026-07-26. A bank-account Source takes plain BSB/account fields
+        directly — no CaptureJS token is required for this source type (only
+        credit-card sources need one), so `details` (account_name, bsb,
+        account_number) maps straight onto the request.
+
+        Creates the Payer on first use for this customer, then attaches (or
+        replaces) a bank-account Source. Only the last four digits of the
+        account number are ever persisted locally, same as the mock.
+        """
+        account_number = str(details.get("account_number") or "")
+        last4 = account_number[-4:] if len(account_number) >= 4 else None
+
+        with self._session_factory() as session:
+            customer = session.get(Customer, customer_id)
+            if customer is None:
+                return PaymentMethodResult(
+                    customer_id=customer_id,
+                    updated=False,
+                    error_code="customer_not_found",
+                    message=f"No customer {customer_id}.",
+                )
+
+            try:
+                if not customer.pinch_payer_id:
+                    payer_response = self._request(
+                        "POST",
+                        "/payers",
+                        json={
+                            "firstName": customer.name or "Customer",
+                            "emailAddress": (
+                                customer.email or f"{customer.id}@example.invalid"
+                            ),
+                        },
+                    ).json()
+                    customer.pinch_payer_id = payer_response["id"]
+
+                source_response = self._request(
+                    "POST",
+                    f"/payers/{customer.pinch_payer_id}/sources",
+                    json={
+                        "sourceType": "bank-account",
+                        "bankAccountName": details.get("account_name"),
+                        "bankAccountBsb": details.get("bsb"),
+                        "bankAccountNumber": account_number,
+                    },
+                ).json()
+            except httpx.HTTPStatusError as exc:
+                return PaymentMethodResult(
+                    customer_id=customer_id,
+                    updated=False,
+                    error_code=f"http_{exc.response.status_code}",
+                    message=exc.response.text,
+                )
+
+            customer.pinch_source_id = source_response["id"]
+            customer.bank_account_name = details.get("account_name")
+            customer.bank_bsb = details.get("bsb")
+            customer.bank_account_last4 = last4
+            customer.payment_method_updated_at = clock.now()
+            session.commit()
+
+        return PaymentMethodResult(
+            customer_id=customer_id,
+            updated=True,
+            account_last4=last4,
+            message="Payment method updated.",
         )
 
 
@@ -357,12 +643,27 @@ class LivePinchClient(PinchClient):
 # --------------------------------------------------------------------------
 
 
-def get_pinch_client() -> PinchClient:
+def get_pinch_client(
+    session_factory: Callable[[], Session] | None = None,
+) -> PinchClient:
     """Return the client for the configured mode.
 
     Not cached: PINCH_MODE is read per call so a test can flip it without
     reaching into module state, and constructing either client is cheap.
+
+    `session_factory` affects both clients, though for different reasons. The
+    mock resolves *every* decision against local tables — it has no socket.
+    The live client has a socket for the actual payment decision, but still
+    needs a session to cache pinch_payer_id/pinch_source_id/pinch_payment_id
+    locally. Callers already holding a session pass a factory bound to the
+    same database — otherwise either client reaches for the module-level
+    SessionLocal and a test would read/write the development database instead
+    of its own.
     """
     if settings.PINCH_MODE == "live":
-        return LivePinchClient()
-    return MockPinchClient()
+        if session_factory is None:
+            return LivePinchClient()
+        return LivePinchClient(session_factory=session_factory)
+    if session_factory is None:
+        return MockPinchClient()
+    return MockPinchClient(session_factory=session_factory)
