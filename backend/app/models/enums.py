@@ -54,3 +54,16 @@ class AttemptStatus(str, Enum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+# Classes where a retry is guaranteed to fail or actively harmful: the account
+# does not exist, the mandate was revoked, or the customer stopped the payment.
+# The rule that separates this product from a cron job — hard failures are
+# never retried. Used by the classifier; values agreed with Person A's enums.
+HARD_FAILURE_CLASSES: frozenset[FailureClass] = frozenset(
+    {
+        FailureClass.INVALID_ACCOUNT,
+        FailureClass.AUTHORITY_CANCELLED,
+        FailureClass.PAYMENT_STOPPED,
+    }
+)
