@@ -352,6 +352,22 @@ def test_bad_bank_details_are_rejected(client, store):
     assert response.status_code == 422
 
 
+def test_pinch_documented_test_account_number_is_accepted(client, store):
+    """1234567890 is the account number Pinch's own test-mode docs tell you to
+    use. A 6-9 digit cap rejected it with a 422, so the update-details flow
+    would have failed on the exact input anyone follows the docs to supply."""
+    payment = store.list_payments(limit=1)[0]
+    response = client.post(
+        f"/api/v1/customers/{payment.customer_id}/payment-method",
+        json={
+            "account_name": "Pinch Test Account",
+            "bsb": "000-001",
+            "account_number": "1234567890",
+        },
+    )
+    assert response.status_code == 200
+
+
 def test_unknown_customer_is_a_contract_404(client):
     response = client.get("/api/v1/customers/cus_nope/payment-method")
     assert response.status_code == 404

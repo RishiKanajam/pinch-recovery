@@ -189,7 +189,10 @@ class PaymentMethodUpdate(BaseModel):
 
     account_name: str = Field(min_length=2, max_length=80)
     bsb: str = Field(pattern=r"^\d{3}-?\d{3}$")
-    account_number: str = Field(pattern=r"^\d{6,9}$")
+    # 6-10 digits. AU account numbers run to ten, and Pinch's own documented
+    # test account is 1234567890 — a 9-digit cap rejected the exact number
+    # their docs tell you to use, which would fail on the live-test path.
+    account_number: str = Field(pattern=r"^\d{6,10}$")
 
 
 class ErrorBody(BaseModel):
