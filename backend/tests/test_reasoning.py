@@ -23,13 +23,13 @@ FROZEN = datetime(2026, 7, 27, 3, 0, tzinfo=timezone.utc)
 
 # One representative raw code per class, so a failure names the class involved.
 CODE_FOR_CLASS = {
-    FailureClass.INSUFFICIENT_FUNDS: "AM04",
-    FailureClass.INVALID_ACCOUNT: "AC01",
-    FailureClass.AUTHORITY_CANCELLED: "MD01",
-    FailureClass.PAYMENT_STOPPED: "MS02",
-    FailureClass.TECHNICAL: "AG01",
-    FailureClass.EXPIRED_CARD: "54",
-    FailureClass.DO_NOT_HONOUR: "05",
+    FailureClass.INSUFFICIENT_FUNDS: "insufficient-funds",
+    FailureClass.INVALID_ACCOUNT: "invalid-account",
+    FailureClass.AUTHORITY_CANCELLED: "authority-cancelled",
+    FailureClass.PAYMENT_STOPPED: "payment-stopped",
+    FailureClass.TECHNICAL: "technical-error",
+    FailureClass.EXPIRED_CARD: "invalid-card",
+    FailureClass.DO_NOT_HONOUR: "blocked-by-bank",
     FailureClass.UNKNOWN: "ZZ99",
 }
 
@@ -87,20 +87,20 @@ def test_reasoning_names_the_specific_payment(table, failure_class, code):
 
 
 def test_reasoning_quotes_the_raw_code(table):
-    result = plan(make_payment("AC01"), table=table)
-    assert "AC01" in result.reasoning
+    result = plan(make_payment("invalid-account"), table=table)
+    assert "invalid-account" in result.reasoning
 
 
 def test_reasoning_explains_why_hard_failures_are_not_retried(table):
     """The core argument of the product has to be legible in this field."""
-    result = plan(make_payment("AC01"), table=table)
+    result = plan(make_payment("invalid-account"), table=table)
     lowered = result.reasoning.lower()
     assert "no retries" in lowered
     assert "fee" in lowered or "cannot" in lowered
 
 
 def test_reasoning_describes_a_retry_when_one_is_scheduled(table):
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     lowered = result.reasoning.lower()
     assert "retr" in lowered
     assert "no retries" not in lowered
@@ -108,7 +108,7 @@ def test_reasoning_describes_a_retry_when_one_is_scheduled(table):
 
 def test_reasoning_mentions_payday_history_when_it_was_used(table):
     customer = CustomerContext(customer_id="cus_01HX0001", payday_weekday=1)
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     assert "payment history" in result.reasoning.lower()
 
 
@@ -118,7 +118,7 @@ def test_reasoning_explains_a_suppressed_retry_budget(table):
         customer_id="cus_01HX0001",
         retries_in_window=rules.customer_max_retries_in_window,
     )
-    result = plan(make_payment("AM04"), customer=customer, table=table)
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
     lowered = result.reasoning.lower()
     assert "budget" in lowered
     assert "relationship problem" in lowered
@@ -128,13 +128,13 @@ def test_reasoning_explains_a_delayed_message(table):
     customer = CustomerContext(
         customer_id="cus_01HX0001", last_message_at=FROZEN - timedelta(hours=1)
     )
-    result = plan(make_payment("AC01"), customer=customer, table=table)
+    result = plan(make_payment("invalid-account"), customer=customer, table=table)
     assert "hours between messages" in result.reasoning.lower()
 
 
 def test_reasoning_stays_quiet_about_rules_that_did_not_fire(table):
     """Boilerplate about inapplicable rules trains the reader to skip the field."""
-    result = plan(make_payment("AM04"), table=table)
+    result = plan(make_payment("insufficient-funds"), table=table)
     assert "budget" not in result.reasoning.lower()
     assert "hours between messages" not in result.reasoning.lower()
 
@@ -147,17 +147,17 @@ def test_missing_code_still_reasons(table):
 
 
 def test_reasoning_for_silent_class_says_so(table):
-    result = plan(make_payment("AG01"), table=table)
+    result = plan(make_payment("technical-error"), table=table)
     assert "silent" in result.reasoning.lower()
 
 
 def test_reasoning_for_churn_signal_frames_it_as_churn(table):
-    result = plan(make_payment("MD01"), table=table)
+    result = plan(make_payment("authority-cancelled"), table=table)
     assert "churn" in result.reasoning.lower()
 
 
 def test_reasoning_for_dispute_routes_to_a_human(table):
-    result = plan(make_payment("MS02"), table=table)
+    result = plan(make_payment("payment-stopped"), table=table)
     lowered = result.reasoning.lower()
     assert "human" in lowered
     assert "no retries" in lowered
@@ -171,8 +171,8 @@ def test_unknown_class_admits_it_does_not_know(table):
 
 def test_money_is_formatted_from_integer_cents(table):
     """No floats in the model; formatting happens at the edge only."""
-    result = plan(make_payment("AM04", amount_cents=1999), table=table)
+    result = plan(make_payment("insufficient-funds", amount_cents=1999), table=table)
     assert "$19.99" in result.reasoning
 
-    result = plan(make_payment("AM04", amount_cents=124900), table=table)
+    result = plan(make_payment("insufficient-funds", amount_cents=124900), table=table)
     assert "$1,249.00" in result.reasoning

@@ -43,20 +43,24 @@ def test_every_raw_code_in_the_yaml_maps_to_its_own_class(table):
 @pytest.mark.parametrize(
     "code,expected",
     [
-        ("AM04", FailureClass.INSUFFICIENT_FUNDS),
-        ("AC01", FailureClass.INVALID_ACCOUNT),
-        ("MD01", FailureClass.AUTHORITY_CANCELLED),
-        ("MS02", FailureClass.PAYMENT_STOPPED),
-        ("AG01", FailureClass.TECHNICAL),
-        ("54", FailureClass.EXPIRED_CARD),
-        ("05", FailureClass.DO_NOT_HONOUR),
+        ("insufficient-funds", FailureClass.INSUFFICIENT_FUNDS),
+        ("invalid-account", FailureClass.INVALID_ACCOUNT),
+        ("authority-cancelled", FailureClass.AUTHORITY_CANCELLED),
+        ("payment-stopped", FailureClass.PAYMENT_STOPPED),
+        ("technical-error", FailureClass.TECHNICAL),
+        ("temporary-problem", FailureClass.TECHNICAL),
+        ("invalid-card", FailureClass.EXPIRED_CARD),
+        ("unsupported-card", FailureClass.EXPIRED_CARD),
+        ("blocked-by-bank", FailureClass.DO_NOT_HONOUR),
     ],
 )
 def test_representative_codes(table, code, expected):
     assert table.classify(code) is expected
 
 
-@pytest.mark.parametrize("code", ["ac01", "AC01 ", " ac01\t", "Ac01"])
+@pytest.mark.parametrize(
+    "code", ["invalid-account", "INVALID-ACCOUNT ", " invalid-account\t", "Invalid-Account"]
+)
 def test_classification_is_case_and_whitespace_insensitive(table, code):
     """Real payloads arrive with inconsistent casing and stray whitespace."""
     assert table.classify(code) is FailureClass.INVALID_ACCOUNT

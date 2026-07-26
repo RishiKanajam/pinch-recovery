@@ -59,7 +59,7 @@ mapping-table row, not a refactor.
   "amount_cents": 24900,
   "currency": "AUD",
   "status": "failed",
-  "raw_code": "AC01",
+  "raw_code": "invalid-account",
   "failure_class": "invalid_account",
   "failed_at": "2026-07-25T04:12:00Z",
   "recovered_at": null,
@@ -194,7 +194,7 @@ Unknown id returns `404` in the standard error shape:
   "customer_id": "cus_01HX...",
   "amount_cents": 24900,
   "outcome": "dishonour",
-  "raw_code": "AC01",
+  "raw_code": "invalid-account",
   "delay_seconds": 259200,
   "webhook_deliveries": 1
 }
@@ -247,7 +247,7 @@ the mock simulator emits this exact envelope so both modes ingest identically.
     "customer_id": "cus_01HX...",
     "amount_cents": 24900,
     "currency": "AUD",
-    "dishonour_code": "AC01"
+    "dishonour_code": "invalid-account"
   }
 }
 ```
@@ -270,7 +270,7 @@ Not called by the frontend or by Person B's code. Local development and demo con
 
 | Method | Path | Purpose |
 |---|---|---|
-| `POST` | `/sim/seed-demo` | Reset, then create ~50 realistic failed payments across all seven failure classes. Run before a demo. Returns a per-class count + `amount_cents` summary. |
+| `POST` | `/sim/seed-demo` | Reset, then create ~50 realistic failed payments across six of the seven failure classes (`expired_card` excluded — see `EXCLUDED_FROM_SEED` in `app/sim/seed.py`). Run before a demo. Returns a per-class count + `amount_cents` summary. |
 
 `/sim/scenarios`, `/sim/fast-forward`, and `/sim/reset` are already specified in the
 main HTTP table above; `seed-demo` is grouped here because, unlike those, it is purely a

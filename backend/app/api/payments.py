@@ -17,6 +17,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.api.schemas import PaymentList, PaymentOut
+from app.core.clock import to_iso_z
 from app.core.db import get_db
 from app.models import Payment
 
@@ -52,7 +53,7 @@ def _stamp(payment: Payment) -> str:
     """Cursor timestamp for a row. Empty string means the row has no failed_at."""
     if payment.failed_at is None:
         return ""
-    return payment.failed_at.isoformat().replace("+00:00", "Z")
+    return to_iso_z(payment.failed_at)
 
 
 def _bad_cursor(cursor: str) -> JSONResponse:
