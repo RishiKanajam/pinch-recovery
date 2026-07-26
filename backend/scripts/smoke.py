@@ -89,7 +89,11 @@ def main() -> int:
     step(1, "POST /sim/reset")
     reset = client.post(f"{api}/sim/reset")
     check("reset returns 200", reset.status_code == 200, f"HTTP {reset.status_code}")
-    check("clock offset back to zero", health.json().get("clock_offset_seconds") == 0)
+    # Re-read health: the reading taken at start-up was from *before* the reset,
+    # so asserting on it failed whenever the server already carried an offset
+    # from an earlier run — which says nothing about whether reset works.
+    offset = client.get(f"{base}/health").json().get("clock_offset_seconds")
+    check("clock offset back to zero", offset == 0, f"offset={offset}")
 
     # ---------------------------------------------------------------- 2
     step(2, "POST /sim/seed-demo")

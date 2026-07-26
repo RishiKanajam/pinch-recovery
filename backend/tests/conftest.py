@@ -12,7 +12,7 @@ from collections.abc import Iterator
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, MetaData, create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import settings
@@ -66,11 +66,18 @@ def engine() -> Iterator[Engine]:
     # Drop before create. create_all only creates tables that are *missing*; it
     # never alters one that already exists, so a column added by a migration
     # never appears in a test database built by an earlier run. The symptom is
-    # brutal to read: a fresh clone passes and an existing machine fails every
+    # brutal to read: a fresh clone passes while an existing machine fails every
     # test with `column "..." does not exist`, which looks like a broken branch
-    # rather than a stale database. Rebuilding from the current metadata every
-    # session means the schema cannot drift from the models.
-    Base.metadata.drop_all(test_engine)
+    # rather than a stale database.
+    #
+    # Reflected rather than Base.metadata.drop_all, because that only drops what
+    # the models still describe — a table removed from the models would survive
+    # forever. Rebuilding from what is actually in the database means the schema
+    # cannot drift from the models in either direction.
+    existing = MetaData()
+    existing.reflect(bind=test_engine)
+    existing.drop_all(bind=test_engine)
+
     Base.metadata.create_all(test_engine)
     yield test_engine
     test_engine.dispose()

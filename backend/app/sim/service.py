@@ -8,6 +8,8 @@ exists to prevent.
 
 from __future__ import annotations
 
+import logging
+
 from datetime import datetime
 from typing import Any
 
@@ -216,6 +218,50 @@ def deliver_due(db: Session) -> list[dict[str, Any]]:
         )
 
     return delivered
+
+
+def drain_due(db: Session, max_rounds: int = 25) -> dict[str, Any]:
+    """Run everything the clock has made due, until nothing is left.
+
+    One pass is not enough, because the two halves feed each other: delivering
+    a webhook creates a payment, executing an attempt presents a retry whose
+    settlement arrives as another webhook, and that settlement can schedule the
+    next attempt. Looping until both report zero is what makes the ledger
+    stable by the time the response is written.
+
+    Without this the work still happens — the background poller picks it up a
+    second or two later — but the numbers on the dashboard depend on how long
+    you wait before looking, which makes a rehearsal unreproducible and a
+    screenshot a matter of timing.
+
+    Executing attempts is Person B's `Repository.execute_due`, called here
+    rather than reimplemented: retry budgets, max_attempts and the write-off
+    horizon all live on their side, and this only decides *when* to ask.
+    """
+    # Imported here rather than at module scope: app.services.repository pulls
+    # in the strategy engine and classifier, and the simulator must not become
+    # a load-order dependency of the engine.
+    from app.services.repository import Repository
+
+    delivered: list[dict[str, Any]] = []
+    executed = 0
+    rounds = 0
+
+    for rounds in range(1, max_rounds + 1):
+        batch = deliver_due(db)
+        delivered.extend(batch)
+        ran = Repository(db).execute_due()
+        executed += ran
+        if not batch and not ran:
+            break
+    else:
+        logger.warning(
+            "drain_due hit its %d-round cap with work still pending; the "
+            "ledger may still be settling.",
+            max_rounds,
+        )
+
+    return {"delivered": delivered, "executed": executed, "rounds": rounds}
 
 
 def due_attempts(db: Session) -> list[dict[str, Any]]:

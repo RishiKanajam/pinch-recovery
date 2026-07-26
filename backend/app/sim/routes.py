@@ -38,17 +38,27 @@ def create_scenario(
 def fast_forward(
     req: FastForwardRequest, db: Session = Depends(get_db)
 ) -> dict[str, Any]:
-    """Advance the simulated clock, then fire whatever that made due."""
+    """Advance the simulated clock, then run everything that made due.
+
+    Drains synchronously rather than leaving the work to the background
+    poller. The poller would get there a second or two later, but that makes
+    the dashboard depend on how long you wait before looking — a rehearsal
+    would not reproduce, and a screenshot would be a matter of timing. By the
+    time this returns, the ledger has settled.
+    """
     clock.fast_forward(req.seconds)
 
-    delivered = service.deliver_due(db)
+    drained = service.drain_due(db)
+    # Should be empty: anything still due after a drain means the loop hit its
+    # round cap, and surfacing it beats a silently half-settled ledger.
     attempts = service.due_attempts(db)
 
     return {
         "clock_offset_seconds": clock.offset_seconds(),
         "now": clock.to_iso_z(clock.now()),
-        "webhooks_delivered": delivered,
-        # Reported, not executed — see service.due_attempts.
+        "webhooks_delivered": drained["delivered"],
+        "attempts_executed": drained["executed"],
+        "drain_rounds": drained["rounds"],
         "attempts_due": attempts,
     }
 
