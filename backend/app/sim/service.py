@@ -14,41 +14,98 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
+from app.api.schemas import EVENT_BANK_RESULTS, STATUS_APPROVED, STATUS_DISHONOURED
 from app.api.webhooks import ingest_pinch_webhook
 from app.core import clock
 from app.core.clock import to_iso_z
 from app.core.ids import new_id
 from app.models import Attempt, Base, Customer, SimulatedWebhook
 
-# Same envelope docs/CONTRACT.md specifies for inbound Pinch events, so mock
-# and live ingest through identical code.
-EVENT_TYPES = {
-    "dishonour": "payment.dishonoured",
-    "success": "payment.succeeded",
+# Same envelope Pinch's real `bank-results` webhook uses (see
+# app/api/schemas.py), so mock and live ingest through identical code. Both
+# outcomes arrive as one event type; the per-payment result is `Status`.
+STATUS_FOR_OUTCOME = {
+    "dishonour": STATUS_DISHONOURED,
+    "success": STATUS_APPROVED,
 }
 
 
 def _build_envelope(
     event_id: str,
-    event_type: str,
     payment_id: str,
     customer_id: str,
     amount_cents: int,
+    status: str,
     raw_code: str | None,
     created_at: datetime,
 ) -> dict[str, Any]:
-    return {
-        "event_id": event_id,
-        "event_type": event_type,
-        "created_at": to_iso_z(created_at),
-        "data": {
-            "payment_id": payment_id,
-            "customer_id": customer_id,
-            "amount_cents": amount_cents,
-            "currency": "AUD",
-            "dishonour_code": raw_code,
-        },
+    payment_entry: dict[str, Any] = {
+        "Id": payment_id,
+        "Status": status,
+        "Amount": amount_cents,
+        "Payer": {"Id": customer_id},
     }
+    # A success carries no dishonour code; a repeat failure carries the
+    # original one, because the underlying cause has not changed.
+    if raw_code:
+        payment_entry["Dishonour"] = {"Type": raw_code, "Description": raw_code}
+
+    return {
+        "Id": event_id,
+        "Type": EVENT_BANK_RESULTS,
+        "EventDate": to_iso_z(created_at),
+        "Data": {"Payments": [payment_entry]},
+    }
+
+
+# A re-presented direct debit settles in roughly two business days — the same
+# fast-forwardable window as the original dishonour, so `+3d` in the UI covers
+# a retry's settlement as well as the first failure.
+SETTLEMENT_SECONDS = 172_800
+
+
+def schedule_settlement(
+    db: Session,
+    *,
+    payment_id: str,
+    customer_id: str,
+    amount_cents: int,
+    succeeded: bool,
+    raw_code: str | None = None,
+    delay_seconds: float = SETTLEMENT_SECONDS,
+) -> str:
+    """Queue the webhook reporting how a re-presented debit settled.
+
+    A retry does not resolve when it is submitted — the bank answers days
+    later, and Pinch reports that answer on the next `bank-results` batch.
+    Routing the outcome back through the same ingest path means a recovery is
+    recorded by exactly the code that will record it in production, rather
+    than the engine marking its own homework.
+    """
+    event_id = new_id("evt")
+    deliver_at = clock.now() + _seconds(delay_seconds)
+
+    envelope = _build_envelope(
+        event_id=event_id,
+        payment_id=payment_id,
+        customer_id=customer_id,
+        amount_cents=amount_cents,
+        status=STATUS_FOR_OUTCOME["success" if succeeded else "dishonour"],
+        # A success carries no dishonour code; a repeat failure carries the
+        # original one, because the underlying cause has not changed.
+        raw_code=None if succeeded else raw_code,
+        created_at=deliver_at,
+    )
+
+    db.add(
+        SimulatedWebhook(
+            event_id=event_id,
+            payload=envelope,
+            deliver_at=deliver_at,
+            delivery_number=1,
+        )
+    )
+    return event_id
 
 
 def create_scenario(db: Session, req) -> dict[str, Any]:
@@ -76,10 +133,10 @@ def create_scenario(db: Session, req) -> dict[str, Any]:
 
     envelope = _build_envelope(
         event_id=event_id,
-        event_type=EVENT_TYPES[req.outcome],
         payment_id=payment_id,
         customer_id=customer_id,
         amount_cents=req.amount_cents,
+        status=STATUS_FOR_OUTCOME[req.outcome],
         raw_code=req.raw_code,
         created_at=deliver_at,
     )
@@ -151,7 +208,7 @@ def deliver_due(db: Session) -> list[dict[str, Any]]:
             {
                 "event_id": item.event_id,
                 "delivery_number": item.delivery_number,
-                "payment_id": item.payload["data"]["payment_id"],
+                "payment_id": item.payload["Data"]["Payments"][0]["Id"],
                 # "duplicate" here is a success: the ledger refused to
                 # double-count a redelivery.
                 "result": status,

@@ -233,36 +233,57 @@ Added by agreement with Person B.
 
 ### Inbound webhook envelope — `POST /webhooks/pinch`
 
-The event Pinch delivers when a payment's state changes. Modelled on Pinch's real
-webhook shape — **verify against the live payload before switching `PINCH_MODE=live`**;
-the mock simulator emits this exact envelope so both modes ingest identically.
+**Verified against https://docs.getpinch.com.au/docs/webhooks and
+https://docs.getpinch.com.au/docs/handle-dishonoured-direct-debit on 2026-07-26** — this
+replaces the earlier invented shape. The mock simulator emits this exact envelope so both
+modes ingest identically. Pinch's default wire format is PascalCase; the schema also
+accepts snake_case via `populate_by_name` (used by the simulator and tests for
+readability).
 
 ```json
 {
-  "event_id": "evt_01HX...",
-  "event_type": "payment.dishonoured",
-  "created_at": "2026-07-25T04:12:00Z",
-  "data": {
-    "payment_id": "pay_01HX...",
-    "customer_id": "cus_01HX...",
-    "amount_cents": 24900,
-    "currency": "AUD",
-    "dishonour_code": "invalid-account"
+  "Id": "evt_def456",
+  "Type": "bank-results",
+  "EventDate": "2026-08-02T08:00:00.000Z",
+  "Data": {
+    "Payments": [
+      {
+        "Id": "pmt_abc001",
+        "Status": "approved",
+        "Amount": 5000,
+        "Payer": { "Id": "pyr_111", "Email": "payer@example.com" }
+      },
+      {
+        "Id": "pmt_abc002",
+        "Status": "dishonoured",
+        "Amount": 5500,
+        "Dishonour": { "Type": "insufficient-funds", "Description": "Insufficient funds in account" },
+        "Payer": { "Id": "pyr_222", "Email": "payer2@example.com" }
+      }
+    ]
   }
 }
 ```
 
-- `event_id` is the idempotency key. Ingest inserts it into `webhook_events` first; a
-  duplicate `event_id` returns 200 and is otherwise a no-op. Same event twice = one
-  payment row.
-- `event_type` values used for the hackathon: `payment.dishonoured` (the one that
-  matters), `payment.succeeded` (marks a prior failure recovered).
-- `dishonour_code` maps to `raw_code` on the payment, then to a `FailureClass` by the
+- **One event type, not two.** Direct debit settlement — success or dishonour — arrives
+  on a single `bank-results` event, delivered once per overnight processing run. There is
+  no separate `payment.succeeded` event. The event is a **batch**: `Data.Payments` covers
+  every payment processed in that run, not one event per payment.
+- `Id` (envelope-level) is the idempotency key. Ingest inserts it into `webhook_events`
+  first; a duplicate `Id` returns 200 and is otherwise a no-op — but redelivering the
+  batch is what's deduplicated, not each payment inside it.
+- Per payment entry, `Status` carries the outcome: `"dishonoured"` (the one that
+  matters), or `"approved"`/`"settled"` (marks a prior failure recovered). Any other
+  status (e.g. `"processing"`, `"scheduled"`) is not a settlement outcome and is ignored.
+- `Dishonour.Type` maps to `raw_code` on the payment, then to a `FailureClass` by the
   classifier. It must be one of the strings in `strategies.yaml` `raw_codes`, or it
-  classifies as `unknown`.
-- `# TODO verify against live webhook` — the field names inside `data` are the most
-  likely thing to differ from Pinch's real shape. This is the known checkpoint for the
-  mock→live switch.
+  classifies as `unknown`. Present only when `Status == "dishonoured"`.
+- `Payer.Id` and payment `Id` are Pinch's own ids (`pyr_...`, `pmt_...`), not ours. A
+  customer or payment never seen before is created using Pinch's id as our own primary
+  key directly (mirrors the existing "unknown customer" placeholder rule) — this is why a
+  live `id` in `GET /payments` may not look like the mock's `pay_01HX...` ULID shape.
+  `Customer.pinch_payer_id` / `Payment.pinch_payment_id` cache the mapping regardless, for
+  the retry/update-payment-method calls on the outbound side.
 
 ### Dev-only simulator endpoints
 

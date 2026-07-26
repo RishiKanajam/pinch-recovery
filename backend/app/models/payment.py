@@ -36,6 +36,13 @@ class Payment(Base):
     # Pinch's own dishonour code, preserved verbatim. failure_class is ours,
     # derived from it by the classifier — the decoupling CONTRACT.md calls for.
     raw_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Pinch's own payment id (`pmt_...`) for the most recent presentation of
+    # this debit — the original dishonour, or the latest retry. NULL in mock
+    # mode. A live retry re-presents as a *new* Pinch payment, so this is
+    # overwritten each time; the settlement webhook is matched back to our
+    # local row by this id, not by ours, because Pinch has never heard of ours.
+    pinch_payment_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
     failure_class: Mapped[str | None] = mapped_column(
         String(32), nullable=True, index=True
     )

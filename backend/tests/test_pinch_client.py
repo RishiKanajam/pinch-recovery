@@ -120,7 +120,7 @@ def test_token_uses_basic_auth_with_app_id_and_secret(monkeypatch):
     LivePinchClient(application_id="app_1", secret_key="sec_1")._get_token()
 
     assert isinstance(captured["auth"], httpx.BasicAuth)
-    assert captured["data"] == {"grant_type": "client_credentials"}
+    assert captured["data"] == {"grant_type": "client_credentials", "scope": "api1"}
 
 
 def test_token_refreshes_after_the_simulated_clock_advances(monkeypatch):

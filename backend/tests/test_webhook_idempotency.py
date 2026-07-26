@@ -50,17 +50,22 @@ def dishonour_event(
     dishonour_code: str = "insufficient-funds",
     amount_cents: int = 24900,
 ) -> dict:
-    """The envelope from docs/CONTRACT.md, Ingestion-internal."""
+    """The envelope from docs/CONTRACT.md, Ingestion-internal — Pinch's real
+    `bank-results` shape, verified 2026-07-26."""
     return {
-        "event_id": event_id,
-        "event_type": "payment.dishonoured",
-        "created_at": "2026-07-25T04:12:00Z",
-        "data": {
-            "payment_id": payment_id,
-            "customer_id": customer_id,
-            "amount_cents": amount_cents,
-            "currency": "AUD",
-            "dishonour_code": dishonour_code,
+        "Id": event_id,
+        "Type": "bank-results",
+        "EventDate": "2026-07-25T04:12:00Z",
+        "Data": {
+            "Payments": [
+                {
+                    "Id": payment_id,
+                    "Status": "dishonoured",
+                    "Amount": amount_cents,
+                    "Dishonour": {"Type": dishonour_code, "Description": dishonour_code},
+                    "Payer": {"Id": customer_id},
+                }
+            ]
         },
     }
 
