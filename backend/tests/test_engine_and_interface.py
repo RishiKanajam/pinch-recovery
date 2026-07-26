@@ -12,6 +12,8 @@ test_reasoning need no database and should stay that way.
 
 from __future__ import annotations
 
+from html import escape
+
 import pytest
 from sqlalchemy import select
 
@@ -468,7 +470,11 @@ def test_dashboard_classifies_what_ingest_left_alone(client, db_session):
 def test_drill_down_renders_the_reasoning(client, store):
     payment = store.list_payments(limit=1)[0]
     html = client.get(f"/payments/{payment.id}").text
-    assert payment.reasoning[:40] in html
+    # Escaped before comparing: several seeded merchants are named "... & Gas"
+    # or "Lawn & Garden Care", and the template correctly renders that "&" as
+    # "&amp;". Comparing raw reasoning against rendered HTML passed only while
+    # the first payment happened to belong to a customer without an ampersand.
+    assert escape(payment.reasoning[:40], quote=False) in html
 
 
 def test_customer_names_with_ampersands_are_escaped(client, store, db_session):

@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.api.schemas import EVENT_BANK_RESULTS, STATUS_APPROVED, STATUS_DISHONOURED
@@ -75,6 +75,7 @@ def schedule_settlement(
     succeeded: bool,
     raw_code: str | None = None,
     delay_seconds: float = SETTLEMENT_SECONDS,
+    presented_at: datetime | None = None,
 ) -> str:
     """Queue the webhook reporting how a re-presented debit settled.
 
@@ -85,7 +86,12 @@ def schedule_settlement(
     than the engine marking its own homework.
     """
     event_id = new_id("evt")
-    deliver_at = clock.now() + _seconds(delay_seconds)
+    # Anchored to when the debit was presented, not to where the clock happens
+    # to be. A retry scheduled for day 5 settles on day 7 whether the demo gets
+    # there in one jump or twenty — otherwise a coarse fast-forward pushes every
+    # settlement past the write-off horizon and the ledger writes off work that
+    # had in fact recovered.
+    deliver_at = (presented_at or clock.now()) + _seconds(delay_seconds)
 
     envelope = _build_envelope(
         event_id=event_id,
@@ -218,6 +224,96 @@ def deliver_due(db: Session) -> list[dict[str, Any]]:
         )
 
     return delivered
+
+
+def _next_event_at(db: Session, after: datetime, target: datetime) -> datetime | None:
+    """The earliest simulated moment with work to do in (after, target]."""
+    webhook_at = db.execute(
+        select(func.min(SimulatedWebhook.deliver_at)).where(
+            SimulatedWebhook.delivered_at.is_(None),
+            SimulatedWebhook.deliver_at > after,
+            SimulatedWebhook.deliver_at <= target,
+        )
+    ).scalar_one_or_none()
+
+    attempt_at = db.execute(
+        select(func.min(Attempt.scheduled_for)).where(
+            Attempt.status == "scheduled",
+            Attempt.scheduled_for.is_not(None),
+            Attempt.scheduled_for > after,
+            Attempt.scheduled_for <= target,
+        )
+    ).scalar_one_or_none()
+
+    candidates = [t for t in (webhook_at, attempt_at) if t is not None]
+    return min(candidates) if candidates else None
+
+
+def advance_to(db: Session, seconds: float, max_steps: int = 400) -> dict[str, Any]:
+    """Advance the simulated clock by `seconds`, replaying events in order.
+
+    Not one big jump. Simulated time is stepped to each moment that has work,
+    and the work at that moment runs with the clock actually standing there.
+
+    This is what makes the demo independent of fast-forward granularity. Jump
+    straight to day 60 and every attempt is due at once, so the write-off
+    scheduled for day 21 executes before the settlement of the retry presented
+    on day 5 — a payment gets written off despite having recovered, and the
+    late settlement then overwrites the terminal status on its way past. One
+    60-day jump and twenty 3-day steps would tell different stories about the
+    same data, and only the stepped one would be true.
+
+    Stepping also fixes `failed_at` for free: ingest stamps clock.now(), and
+    with the clock standing at the settlement's own moment that is the right
+    answer rather than wherever a coarse jump happened to land.
+    """
+    # Derived from the requested size, not from a re-measured instant: the
+    # caller asked to move the clock by `seconds`, and that is what must hold
+    # at the end no matter how long the replay itself takes in real time.
+    target_offset = clock.offset_seconds() + seconds
+    target = clock.now() + _seconds(seconds)
+
+    delivered: list[dict[str, Any]] = []
+    executed = 0
+    steps = 0
+
+    # Work already due before we move anywhere.
+    batch = drain_due(db)
+    delivered.extend(batch["delivered"])
+    executed += batch["executed"]
+
+    while steps < max_steps:
+        moment = _next_event_at(db, clock.now(), target)
+        if moment is None:
+            break
+        steps += 1
+        clock.fast_forward((moment - clock.now()).total_seconds())
+        batch = drain_due(db)
+        delivered.extend(batch["delivered"])
+        executed += batch["executed"]
+
+    if steps >= max_steps:
+        logger.warning("advance_to hit its %d-step cap before %s", max_steps, target)
+
+    # Land exactly on the requested time even if nothing was due at the end.
+    remaining = (target - clock.now()).total_seconds()
+    if remaining > 0:
+        clock.fast_forward(remaining)
+        batch = drain_due(db)
+        delivered.extend(batch["delivered"])
+        executed += batch["executed"]
+
+    # Correct the offset to exactly what was asked for. Stepping measures each
+    # hop against clock.now(), which includes real time — so the seconds spent
+    # replaying get silently subtracted from the advance, and a caller asking
+    # for three days gets three days minus however long the work took. The
+    # offset is the number the caller and /health agree on, so it has to be
+    # exact rather than approximately right.
+    drift = target_offset - clock.offset_seconds()
+    if drift:
+        clock.fast_forward(drift)
+
+    return {"delivered": delivered, "executed": executed, "steps": steps}
 
 
 def drain_due(db: Session, max_rounds: int = 25) -> dict[str, Any]:

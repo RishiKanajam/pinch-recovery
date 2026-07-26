@@ -81,11 +81,19 @@ class PinchClient(ABC):
     """What Person B codes against. Neither method may reveal the mode."""
 
     @abstractmethod
-    def retry_payment(self, payment_id: str) -> RetryResult:
+    def retry_payment(
+        self, payment_id: str, presented_at: datetime | None = None
+    ) -> RetryResult:
         """Re-present a failed debit.
 
         Returns once the instruction is accepted. The eventual success or
         dishonour arrives separately at POST /webhooks/pinch.
+
+        `presented_at` is the simulated moment the presentation is deemed to
+        happen — an attempt's own `scheduled_for`, not the wall the clock
+        happens to be at when a fast-forward runs. Defaults to clock.now() for
+        a presentation happening right now. See MockPinchClient.retry_payment
+        for why this has to be threaded through rather than read inside.
         """
 
     @abstractmethod
@@ -232,8 +240,26 @@ class MockPinchClient(PinchClient):
         # settle, and tests assert against it without a database round trip.
         self.calls: list[OutboundCall] = []
 
-    def retry_payment(self, payment_id: str) -> RetryResult:
+    def retry_payment(
+        self, payment_id: str, presented_at: datetime | None = None
+    ) -> RetryResult:
+        """Re-present a debit as at `presented_at`.
+
+        Both the outcome and the settlement date are anchored to that moment,
+        not to clock.now(). A retry scheduled for day 5 settles on day 7 whether
+        the demo reaches day 7 in one 60-day jump or twenty 3-day steps — the
+        answer is a function of simulated time, not of how coarsely anyone
+        fast-forwards. Reading clock.now() here is the same wall-clock coupling
+        the clock discipline exists to prevent, one layer below the guard test:
+        clock.now() *is* the simulated clock, so the guard cannot see it.
+
+        It matters twice over. The settlement lands on the right day rather than
+        after a write-off that has already fired, and the payday-funds window is
+        evaluated on the weekday the retry was actually scheduled for — which is
+        the whole point of aligning retries to payday.
+        """
         self.calls.append(OutboundCall("retry_payment", {"payment_id": payment_id}))
+        at = presented_at or clock.now()
 
         with self._session_factory() as session:
             payment = session.get(Payment, payment_id)
@@ -273,7 +299,7 @@ class MockPinchClient(PinchClient):
                 failure_class=payment.failure_class,
                 attempt_number=_executed_retry_count(session, payment_id),
                 customer=customer,
-                at=clock.now(),
+                at=at,
             )
             schedule_settlement(
                 session,
@@ -282,6 +308,7 @@ class MockPinchClient(PinchClient):
                 amount_cents=payment.amount_cents,
                 succeeded=succeeded,
                 raw_code=payment.raw_code,
+                presented_at=at,
             )
             session.commit()
 
@@ -471,8 +498,15 @@ class LivePinchClient(PinchClient):
         self._token = None
         self._token_expires_at = None
 
-    def retry_payment(self, payment_id: str) -> RetryResult:
+    def retry_payment(
+        self, payment_id: str, presented_at: datetime | None = None
+    ) -> RetryResult:
         """Re-present a failed debit as a new Pinch payment.
+
+        `presented_at` is accepted for interface parity and ignored: against the
+        real API a presentation happens when it happens. Pinch's test mode does
+        honour a Time-Travel header, so it could carry this eventually — but
+        that belongs with the live wiring, not a guess made here.
 
         Verified against https://docs.getpinch.com.au/reference/save-payment
         on 2026-07-26. Pinch has no "retry" endpoint — a retry is a fresh

@@ -201,6 +201,14 @@ def _make_customers(rng: random.Random) -> list[Customer]:
     for suburb, (trade, slug) in combos[:CUSTOMER_COUNT]:
         customers.append(
             Customer(
+                # From the seeded RNG, not the model default. new_id() uses
+                # os.urandom, and the id is not merely a label: a customer
+                # without an observed payday has one derived by hashing it
+                # (see _payday_weekday), which decides whether a retry lands in
+                # that customer's funds window. Random ids therefore moved the
+                # retry outcomes every run, and the same seed told a different
+                # story each time it was demoed.
+                id=f"cus_{_ulid(rng)}",
                 name=f"{suburb} {trade}",
                 email=f"accounts@{_slug(suburb)}{slug}.com.au",
                 phone=f"04{rng.randint(10, 99)} {rng.randint(100, 999)} "
@@ -260,7 +268,16 @@ def seed_demo(db: Session) -> dict[str, Any]:
     db.add_all(customers)
     db.flush()
 
-    now = clock.now()
+    # Anchored to the start of the current day, not to the instant the button
+    # was pressed. Every failed_at is derived from this, and the engine's
+    # scheduling is weekday- and time-of-day sensitive: retries align to payday
+    # weekdays and land at fixed hours, and the mock bank decides whether an
+    # account holds funds from the weekday a retry falls on. Anchoring to
+    # clock.now() therefore made the whole ledger a function of *when you ran
+    # it* — two runs a few minutes apart could push a payment's retry across a
+    # midnight boundary and change whether it recovered. Quantising to midnight
+    # makes a rehearsal and the live run produce the same dashboard all day.
+    now = clock.now().replace(hour=0, minute=0, second=0, microsecond=0)
     # (payment_id, failure_class, amount_cents, age_seconds)
     planned: list[tuple[str, str, int, int]] = []
 

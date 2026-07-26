@@ -93,6 +93,19 @@ def _record_dishonour(db: Session, item: PinchPaymentResult) -> str:
     customer = _resolve_customer(db, item)
     payment = _resolve_payment(db, item, customer.id if customer else None)
 
+    # A dishonour for a payment that has already reached a terminal state is
+    # the settlement of a presentation the engine has since moved past — the
+    # last retry answering after the write-off horizon already fired. Record
+    # the event (webhook_events already holds it) but leave the payment alone.
+    #
+    # Without this the payment is resurrected from `written_off` back to
+    # `failed` with no attempts left to rescue it, and sticks there. Worse,
+    # whether that happens depends on whether the settlement lands before or
+    # after the write-off, which moves with fast-forward granularity — so the
+    # same seed told different stories depending on how the demo was driven.
+    if payment.status in ("written_off", "recovered"):
+        return payment.id
+
     payment.amount_cents = item.amount
     payment.status = "failed"
     # Pinch's code, preserved verbatim. failure_class stays NULL — deriving it

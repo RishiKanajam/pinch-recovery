@@ -464,7 +464,13 @@ class Repository:
                 # `recovered`. Deciding the outcome here instead would be the
                 # engine marking its own homework, and would leave the ingest
                 # path that has to record real recoveries permanently unused.
-                result = self._pinch_client().retry_payment(payment_row.id)
+                #
+                # Presented as at the attempt's own scheduled time, so the
+                # settlement lands on a date fixed in simulated time rather than
+                # one that moves with fast-forward granularity.
+                result = self._pinch_client().retry_payment(
+                    payment_row.id, presented_at=attempt_row.scheduled_for
+                )
                 if result.accepted:
                     attempt_row.status = AttemptStatus.EXECUTED.value
                     attempt_row.note = (

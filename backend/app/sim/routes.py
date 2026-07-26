@@ -46,9 +46,10 @@ def fast_forward(
     would not reproduce, and a screenshot would be a matter of timing. By the
     time this returns, the ledger has settled.
     """
-    clock.fast_forward(req.seconds)
-
-    drained = service.drain_due(db)
+    # Replay to the target rather than jumping to it: events run with the
+    # clock standing at their own moment, so the ledger a 60-day jump produces
+    # is the ledger twenty 3-day steps produce.
+    drained = service.advance_to(db, req.seconds)
     # Should be empty: anything still due after a drain means the loop hit its
     # round cap, and surfacing it beats a silently half-settled ledger.
     attempts = service.due_attempts(db)
@@ -58,7 +59,7 @@ def fast_forward(
         "now": clock.to_iso_z(clock.now()),
         "webhooks_delivered": drained["delivered"],
         "attempts_executed": drained["executed"],
-        "drain_rounds": drained["rounds"],
+        "replay_steps": drained["steps"],
         "attempts_due": attempts,
     }
 
