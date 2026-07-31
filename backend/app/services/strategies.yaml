@@ -109,39 +109,47 @@ classes:
   expired_card:
     # Card codes, not direct debit. Kept for card-funded subscriptions.
     raw_codes: ["invalid-card", "unsupported-card"]
-    diagnosis: "Predictable and preventable."
-    max_attempts: 1
+    diagnosis: "The card itself is unusable. New details are the only fix."
+    max_attempts: 0
     notify_human: false
     actions:
-      - action: retry
-        delay_hours: 1
-        align_to_payday: false
       - action: request_details_update
         channel: email
-        delay_hours: 24
+        delay_hours: 0
         tone: soft
+      - action: request_details_update
+        channel: sms
+        delay_hours: 48
     reasoning: >
-      Card expiry is knowable in advance. Recovery here is a fallback — the real
-      fix is the preventive job that warns 14 days before expiry.
+      Pinch marks invalid-card and unsupported-card non-retryable: the card
+      cannot be charged as it stands, so re-presenting it only earns another
+      decline. Straight to new details. The real fix is the preventive job that
+      warns 14 days before an expiry, which is on the roadmap.
 
   do_not_honour:
-    # Pinch marks blocked-by-bank NON-retryable. The single retry below
-    # contradicts that — see OPEN QUESTION 1 in docs/pinch-codes-proposal.md.
+    # blocked-by-bank. A hard failure, per Pinch's own documentation: the bank
+    # will reject all future attempts. A retry cannot succeed and earns another
+    # dishonour fee, so this takes the same protocol as the other hard classes.
     raw_codes: ["blocked-by-bank"]
-    diagnosis: "Ambiguous. Issuer risk rules, limits, or something unstated."
-    max_attempts: 1
-    notify_human: false
+    diagnosis: "The bank has blocked this debit and will reject every retry."
+    max_attempts: 0
+    notify_human: true
     actions:
-      - action: retry
-        delay_hours: 48
-        align_to_payday: false
       - action: request_details_update
         channel: email
-        delay_hours: 72
-        tone: neutral
+        delay_hours: 0
+        tone: urgent
+      - action: request_details_update
+        channel: sms
+        delay_hours: 48
+      - action: notify_human
+        delay_hours: 96
     reasoning: >
-      The issuer declined without stating why. One retry is worth attempting;
-      repeated attempts risk the merchant being flagged. Cap and move to details.
+      The bank blocked this debit outright, and Pinch's documentation is
+      explicit that it will reject all future attempts. Retrying cannot succeed
+      and each attempt costs another dishonour fee, so this is never retried:
+      the customer is asked for a different account, escalating from email to
+      SMS, and a human is told if it is still unresolved after four days.
 
   unknown:
     raw_codes: []

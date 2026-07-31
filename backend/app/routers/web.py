@@ -56,6 +56,11 @@ def _class_label(failure_class: FailureClass | str | None) -> str:
     if failure_class is None:
         return "Unclassified"
     value = getattr(failure_class, "value", failure_class)
+    # `do_not_honour` is our internal name for Pinch's `blocked-by-bank`.
+    # Titling the raw value showed "Do Not Honour", which reads as an
+    # ambiguous decline worth another try — the opposite of what it means.
+    if value == "do_not_honour":
+        return "Blocked By Bank"
     return str(value).replace("_", " ").title()
 
 

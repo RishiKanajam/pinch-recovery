@@ -70,5 +70,10 @@ HARD_FAILURE_CLASSES: frozenset[FailureClass] = frozenset(
         FailureClass.INVALID_ACCOUNT,
         FailureClass.AUTHORITY_CANCELLED,
         FailureClass.PAYMENT_STOPPED,
+        # blocked-by-bank. Pinch's docs are explicit that the bank will reject
+        # all future attempts, so a retry cannot succeed and only earns another
+        # dishonour fee. Previously modelled as a soft "ambiguous decline" and
+        # retried once; that disagreed with the processor's own documentation.
+        FailureClass.DO_NOT_HONOUR,
     }
 )

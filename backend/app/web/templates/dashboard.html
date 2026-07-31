@@ -105,7 +105,7 @@ td.why .hl .cls { color: var(--muted); }
      href="{% if selected_class and selected_class.value == c.failure_class.value %}/{% else %}/?failure_class={{ c.failure_class.value }}{% endif %}">
     <div class="nm">
       {{ c.failure_class | class_label }}
-      {% if c.failure_class.value in ('invalid_account', 'authority_cancelled', 'payment_stopped') %}
+      {% if c.failure_class.value in ('invalid_account', 'authority_cancelled', 'payment_stopped', 'do_not_honour') %}
         <span class="pill hard" title="Never retried — a retry cannot succeed and incurs a fee">no retry</span>
       {% endif %}
     </div>

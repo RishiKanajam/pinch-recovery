@@ -51,8 +51,7 @@ _WHAT_HAPPENED: dict[FailureClass, str] = {
     ),
     FailureClass.EXPIRED_CARD: ("The card on file has passed its expiry date"),
     FailureClass.DO_NOT_HONOUR: (
-        "The issuer declined the debit without saying why — a risk rule, a limit, "
-        "or something it will not disclose"
+        "The bank blocked this debit and will reject every future attempt"
     ),
     FailureClass.UNKNOWN: (
         "The bank returned a dishonour code this system does not recognise yet"
@@ -84,12 +83,13 @@ _WHY_THIS_RESPONSE: dict[FailureClass, str] = {
         "manufacture churn out of a bank outage, so the retry stays silent"
     ),
     FailureClass.EXPIRED_CARD: (
-        "Expiry is knowable in advance, so recovery here is the fallback — one "
-        "retry in case the card was already replaced, then ask for new details"
+        "A card that cannot be charged as it stands only declines again, so this "
+        "is never retried — new details are the only route back"
     ),
     FailureClass.DO_NOT_HONOUR: (
-        "One retry is worth attempting because the decline may be transient, but "
-        "repeated attempts risk the merchant being flagged, so the cap is hard"
+        "Pinch's documentation is explicit that a blocked debit is rejected on "
+        "every future attempt, so it is never retried — new details are asked "
+        "for and a human is told if it stays unresolved"
     ),
     FailureClass.UNKNOWN: (
         "Guessing would be worse than asking, so this takes one cautious retry and "

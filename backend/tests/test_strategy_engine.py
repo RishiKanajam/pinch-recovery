@@ -128,12 +128,20 @@ def test_technical_retries_twice_and_stays_silent(table):
     ]
 
 
-def test_expired_card_retries_once_then_asks_for_details(table):
-    result = plan(make_payment("invalid-card"), table=table)
-    assert result.retry_count == 1
-    assert ActionType.REQUEST_DETAILS_UPDATE in {
-        a.action for a in result.scheduled_attempts
-    }
+def test_card_failures_are_never_retried_only_asked_to_update(table):
+    """Pinch marks invalid-card and unsupported-card non-retryable.
+
+    This previously asserted a single retry, which encoded our disagreement
+    with the processor's own documentation rather than a decision anyone had
+    made — a re-presentation of a card that cannot be charged only earns a
+    second decline.
+    """
+    for code in ("invalid-card", "unsupported-card"):
+        result = plan(make_payment(code), table=table)
+        assert result.retry_count == 0, code
+        assert ActionType.REQUEST_DETAILS_UPDATE in {
+            a.action for a in result.scheduled_attempts
+        }
 
 
 # --- payday alignment ----------------------------------------------------------
