@@ -11,16 +11,17 @@ so both modes ingest identically.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, field_serializer
+from pydantic import BaseModel, ConfigDict, Field, field_serializer, model_validator
 
 from app.core.clock import to_iso_z
 
-# Pinch's default wire format is PascalCase (e.g. "Id", "EventDate"); a
-# camelCase format is also offered but PascalCase is what the docs' own
-# examples use, and what the mock simulator emits. `populate_by_name=True`
-# on every model below also accepts the lower_snake_case field names, which
-# this codebase's tests and the simulator use for readability.
+# Pinch's webhook wire format is PascalCase (e.g. "Id", "EventDate") and the
+# Events API returns the same objects in camelCase ("id", "eventDate"). Both
+# reach the same ingest path — push and poll — so `PinchModel` below matches
+# keys case-insensitively, which also accepts the lower_snake_case names this
+# codebase's tests and simulator use for readability.
 
 # Direct debit settlement — success or dishonour — arrives on exactly one
 # event type, delivered once per overnight processing run and covering every
@@ -39,11 +40,45 @@ STATUS_APPROVED = "approved"
 STATUS_SUCCEEDED = frozenset({STATUS_APPROVED, "settled"})
 
 
-class PinchDishonour(BaseModel):
-    """`Dishonour` on a `bank-results` payment entry. Present only when
-    `status == "dishonoured"`."""
+class PinchModel(BaseModel):
+    """An inbound Pinch object, parsed regardless of how the keys are cased.
+
+    Pinch delivers webhooks in PascalCase (`Id`, `EventDate`) but the Events
+    API returns the same objects in camelCase (`id`, `eventDate`), and the docs
+    say a camelCase webhook format is available too. Since the same envelope
+    reaches us by both push and poll, keys are matched case-insensitively
+    against the field name and its alias rather than picking one spelling and
+    silently failing to parse the other — a poller that dropped every event
+    because of a capital letter would look exactly like Pinch sending nothing.
+    """
 
     model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _match_keys_case_insensitively(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        canonical: dict[str, str] = {}
+        for name, field in cls.model_fields.items():
+            canonical[name.lower().replace("_", "")] = name
+            if field.alias:
+                canonical[field.alias.lower().replace("_", "")] = name
+
+        out: dict[Any, Any] = {}
+        for key, value in data.items():
+            target = canonical.get(str(key).lower().replace("_", "")) if isinstance(key, str) else None
+            # Unmatched keys are kept as they came: extra="allow" means the raw
+            # envelope stays inspectable, which is what makes a mis-parse
+            # diagnosable from the stored payload.
+            out[target or key] = value
+        return out
+
+
+class PinchDishonour(PinchModel):
+    """`Dishonour` on a `bank-results` payment entry. Present only when
+    `status == "dishonoured"`."""
 
     # Hyphenated lowercase, e.g. "insufficient-funds" — see
     # docs/pinch-codes-proposal.md for the full verified set.
@@ -51,19 +86,15 @@ class PinchDishonour(BaseModel):
     description: str | None = Field(default=None, alias="Description")
 
 
-class PinchPayer(BaseModel):
+class PinchPayer(PinchModel):
     """`Payer` on a `bank-results` payment entry — who was debited."""
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     id: str = Field(alias="Id")
     email: str | None = Field(default=None, alias="Email")
 
 
-class PinchPaymentResult(BaseModel):
+class PinchPaymentResult(PinchModel):
     """One entry in a `bank-results` event's `Data.Payments` array."""
-
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     id: str = Field(alias="Id")
     status: str = Field(alias="Status")
@@ -72,17 +103,13 @@ class PinchPaymentResult(BaseModel):
     payer: PinchPayer | None = Field(default=None, alias="Payer")
 
 
-class PinchEventData(BaseModel):
+class PinchEventData(PinchModel):
     # Unknown fields are kept rather than rejected: Pinch adding a field must
     # not start returning 422 to their retrying webhook sender.
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
     payments: list[PinchPaymentResult] = Field(default_factory=list, alias="Payments")
 
 
-class PinchWebhookEvent(BaseModel):
-    model_config = ConfigDict(extra="allow", populate_by_name=True)
-
+class PinchWebhookEvent(PinchModel):
     event_id: str = Field(alias="Id", min_length=1)
     event_type: str = Field(alias="Type")
     created_at: datetime | None = Field(default=None, alias="EventDate")

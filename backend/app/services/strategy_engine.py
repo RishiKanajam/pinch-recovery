@@ -39,7 +39,12 @@ from app.models.enums import (
 )
 from app.models.schemas import Attempt, Payment, Strategy
 from app.services.classifier import GlobalRules, StrategyTable, get_strategy_table
-from app.services.scheduler import hours_from, next_payday
+from app.services.scheduler import (
+    business_day,
+    hours_from,
+    next_month_equivalent,
+    next_payday,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +52,20 @@ logger = logging.getLogger(__name__)
 # (it pages the account owner, not the customer) and a silent retry is invisible
 # by design, so neither counts against the message-frequency cap.
 CUSTOMER_FACING_ACTIONS = frozenset(
-    {ActionType.REQUEST_DETAILS_UPDATE, ActionType.SAVE_OFFER}
+    {ActionType.REQUEST_DETAILS_UPDATE, ActionType.SAVE_OFFER, ActionType.OFFER_SPLIT}
 )
+
+
+def looks_monthly(payment: Payment, rules: GlobalRules) -> bool:
+    """Whether this payment reads as a monthly bill rather than a weekly one.
+
+    Amount is the only signal available on a first dishonour, and it is a
+    decent one: a $39 debit is a weekly or fortnightly service, a $340 one is
+    somebody's monthly invoice. It is a heuristic and the reasoning string says
+    so — nothing here is learned from history, and claiming otherwise is the
+    overstatement docs/CONTRACT.md and the pitch both refuse to make.
+    """
+    return payment.amount_cents >= rules.monthly_payer_min_cents
 
 
 @dataclass
@@ -111,6 +128,21 @@ def _attempt_id(payment_id: str, n: int) -> str:
     return f"att_{payment_id.removeprefix('pay_')}_{n:02d}"
 
 
+def _money(cents: int) -> str:
+    return f"${cents / 100:,.2f}"
+
+
+def split_halves(amount_cents: int) -> tuple[int, int]:
+    """Split an amount into two instalments that add back to it exactly.
+
+    Integer cents, so an odd amount puts the extra cent on the first
+    instalment. Money never becomes a float here, and the two halves summing
+    to the original is the property that keeps the ledger honest.
+    """
+    first = (amount_cents + 1) // 2
+    return first, amount_cents - first
+
+
 def plan(
     payment: Payment,
     customer: CustomerContext | None = None,
@@ -151,8 +183,6 @@ def plan(
             f"Code {payment.raw_code!r} is not in the strategy table. Treated "
             "conservatively and flagged for a human to extend the mapping."
         )
-
-    write_off_at = hours_from(at, rules.write_off_after_days * 24)
 
     attempts: list[Attempt] = []
     counter = 0
@@ -224,8 +254,29 @@ def plan(
             "problem is the relationship, not this invoice."
         )
 
+    # --- write-off horizon --------------------------------------------------
+    # Computed before the retries because it caps them, and it depends on
+    # whether this ladder will step out to a monthly date: a monthly payer's
+    # next realistic chance to pay is their next billing date, and closing the
+    # file at 21 days would write the payment off days before the only attempt
+    # likely to work. The extension applies only when that attempt is actually
+    # scheduled — it is not a longer horizon for large amounts in general.
+    repeats_available = min(strategy.max_attempts, retry_budget_left)
+    monthly_payer = looks_monthly(payment, rules)
+    monthly_escalates = (
+        monthly_payer
+        and repeats_available >= rules.monthly_escalation_attempt
+        and any(a.align_to_payday for a in retry_actions)
+    )
+    write_off_days = (
+        rules.monthly_payer_write_off_days
+        if monthly_escalates
+        else rules.write_off_after_days
+    )
+    write_off_at = hours_from(at, write_off_days * 24)
+
     for action in retry_actions:
-        repeats = min(strategy.max_attempts, retry_budget_left)
+        repeats = repeats_available
         # Repeats are spaced from the *previous retry*, not from classification.
         # Measuring every repeat from t0 looks equivalent but is not: once
         # payday alignment moves retry 1 forward to Thursday, a retry 2 measured
@@ -233,32 +284,58 @@ def plan(
         # later, so "four retries on successive paydays" collapses into two
         # retries on consecutive mornings. Chaining keeps the interval real.
         previous = at
+        stepped_monthly = False
         for i in range(repeats):
-            target = hours_from(previous, action.delay_hours)
+            number = i + 1
             note_parts = []
-            if action.align_to_payday:
-                aligned = next_payday(target, customer.payday_weekdays(rules))
-                if aligned != target:
-                    source = (
-                        f"observed payday ({_weekday_name(customer.payday_weekday)})"
-                        if customer.has_observed_payday
-                        else "default payday window (Thu/Fri)"
-                    )
-                    note_parts.append(f"Aligned to customer's {source}.")
-                target = aligned
+
+            if monthly_escalates and number >= rules.monthly_escalation_attempt:
+                # Two payday attempts have already failed, which is evidence the
+                # problem is not "wrong week" — it is that this customer's money
+                # arrives monthly. Stepping to their next equivalent date beats a
+                # third attempt on the same weekly rhythm that just failed twice.
+                target = next_month_equivalent(previous if stepped_monthly else at)
+                stepped_monthly = True
+                note_parts.append(
+                    "Stepped to next month's equivalent date — the amount reads "
+                    "as a monthly bill, so the next real chance to collect is "
+                    "their next billing date, not another weekly payday."
+                )
+            else:
+                target = hours_from(previous, action.delay_hours)
+                if action.align_to_payday:
+                    aligned = next_payday(target, customer.payday_weekdays(rules))
+                    if aligned != target:
+                        source = (
+                            f"observed payday ({_weekday_name(customer.payday_weekday)})"
+                            if customer.has_observed_payday
+                            else "default payday window (Thu/Fri)"
+                        )
+                        note_parts.append(f"Aligned to customer's {source}.")
+                    target = aligned
+
+            # Applied to every retry, aligned or not: a fixed +24h technical
+            # retry lands on a Saturday one week in seven, and the bank would
+            # hold it until Monday anyway.
+            target, moved_off = business_day(target)
+            if moved_off is not None:
+                note_parts.append(
+                    f"Rolled forward off {moved_off} — banks do not process then."
+                )
+
             if action.silent:
                 note_parts.append("Silent — customer is not told.")
             if repeats > 1:
-                note_parts.append(f"Retry {i + 1} of {repeats}.")
+                note_parts.append(f"Retry {number} of {repeats}.")
             previous = target
 
             if target > write_off_at:
                 add(
                     ActionType.RETRY,
                     None,
-                    f"Skipped: retry {i + 1} of {repeats} would land "
+                    f"Skipped: retry {number} of {repeats} would land "
                     f"{target.date().isoformat()}, past the "
-                    f"{rules.write_off_after_days}-day write-off horizon.",
+                    f"{write_off_days}-day write-off horizon.",
                     status=AttemptStatus.SKIPPED,
                 )
                 continue
@@ -271,6 +348,14 @@ def plan(
                 f"Scheduled {repeats} retr{'y' if repeats == 1 else 'ies'} "
                 f"{when}, first at +{action.delay_hours}h."
             )
+        if monthly_escalates:
+            trace.append(
+                f"{_money(payment.amount_cents)} reads as a monthly bill, so "
+                f"attempt {rules.monthly_escalation_attempt} steps to next "
+                "month's equivalent date rather than a third weekly payday, and "
+                f"the write-off horizon extends to {write_off_days} days to "
+                "cover it."
+            )
 
     # --- customer messages, subject to the frequency cap --------------------
     # Walked in schedule order so the cap applies to the sequence the customer
@@ -282,9 +367,43 @@ def plan(
     last_contact = customer.last_message_at
     min_gap = rules.min_hours_between_customer_messages
 
+    # An offer to split the balance is a response to repeated failure, so it is
+    # anchored behind the last retry rather than to a fixed offset from the
+    # dishonour. Sending it on day 10 while a retry is still due on day 12 would
+    # tell the customer we have given up on an attempt we are about to make.
+    last_retry_at = max(
+        (
+            a.scheduled_for
+            for a in attempts
+            if a.action is ActionType.RETRY and a.scheduled_for is not None
+        ),
+        default=None,
+    )
+
     for action in message_actions:
         target = hours_from(at, action.delay_hours)
         note_parts = []
+
+        if action.action is ActionType.OFFER_SPLIT:
+            if last_retry_at is None:
+                # No retries were scheduled, so there is no "repeated failure"
+                # for the offer to follow. Suppressed rather than sent early.
+                add(
+                    action.action,
+                    None,
+                    "Skipped: no retries were scheduled, so there is no "
+                    "repeated failure for a split offer to follow.",
+                    channel=action.channel,
+                    status=AttemptStatus.SKIPPED,
+                )
+                continue
+            settled_by = hours_from(last_retry_at, 24)
+            if settled_by > target:
+                target = settled_by
+                note_parts.append(
+                    "Held until the scheduled retries have run — the offer only "
+                    "makes sense once the full amount has failed twice."
+                )
 
         if last_contact is not None:
             earliest = hours_from(last_contact, min_gap)
@@ -327,6 +446,17 @@ def plan(
             f"Customer contact scheduled via {channels or 'email'}, "
             f"never closer together than {min_gap}h."
         )
+    if any(
+        a.action is ActionType.OFFER_SPLIT and a.status is AttemptStatus.SCHEDULED
+        for a in attempts
+    ):
+        halves = split_halves(payment.amount_cents)
+        trace.append(
+            f"If the retries both come back short, the customer is offered "
+            f"{_money(payment.amount_cents)} as "
+            f"{_money(halves[0])} + {_money(halves[1])} across two paydays "
+            "rather than the same figure a third time."
+        )
 
     # --- human escalation ---------------------------------------------------
     for action in (a for a in strategy.actions if a.action is ActionType.NOTIFY_HUMAN):
@@ -342,15 +472,15 @@ def plan(
     if strategy.notify_human:
         trace.append("A human is told about this one regardless of outcome.")
 
-    # --- write-off horizon --------------------------------------------------
+    # --- write-off ----------------------------------------------------------
     add(
         ActionType.WRITE_OFF,
         write_off_at,
-        f"Written off if still unrecovered {rules.write_off_after_days} days "
-        "after the failure.",
+        f"Written off if still unrecovered {write_off_days} days after the "
+        "failure.",
     )
     trace.append(
-        f"Write-off horizon {rules.write_off_after_days} days after the failure "
+        f"Write-off horizon {write_off_days} days after the failure "
         f"({write_off_at.date().isoformat()})."
     )
 
@@ -375,6 +505,7 @@ def plan(
         attempts=attempts,
         customer=customer,
         rules=rules,
+        write_off_days=write_off_days,
     )
 
     return RecoveryPlan(

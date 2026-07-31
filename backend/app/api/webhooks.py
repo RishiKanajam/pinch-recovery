@@ -88,6 +88,11 @@ def _resolve_payment(db: Session, item: PinchPaymentResult, customer_id: str | N
     return payment
 
 
+# A dishonour for a payment already in one of these states settles a
+# presentation that was in flight before the file closed. See _record_dishonour.
+_TERMINAL_STATUSES = ("recovered", "written_off")
+
+
 def _record_dishonour(db: Session, item: PinchPaymentResult) -> str:
     """Create or update the failed payment. Returns the payment id."""
     customer = _resolve_customer(db, item)
@@ -107,6 +112,26 @@ def _record_dishonour(db: Session, item: PinchPaymentResult) -> str:
         return payment.id
 
     payment.amount_cents = item.amount
+
+    if payment.status in _TERMINAL_STATUSES:
+        # A dishonour arriving after the file closed is the settlement of a
+        # presentation made before it closed — the bank's answer to a question
+        # asked days ago. Recording it must not reopen the payment:
+        #
+        #   * `written_off` reopened would leave a payment with a live status
+        #     and a dead ladder — no scheduled attempts, no end state, and a
+        #     write-off that has already fired and cannot fire again.
+        #   * `recovered` reopened would be worse: the customer fixed their
+        #     details, we debited the *new* account and it cleared. A stale
+        #     dishonour against the old account is not evidence that failed,
+        #     and letting it through would walk the recovered counter backwards
+        #     mid-demo for a payment that is genuinely paid.
+        #
+        # The code is still recorded, so the reason the presentation failed is
+        # not lost — only the status is left alone.
+        payment.raw_code = item.dishonour.type if item.dishonour else payment.raw_code
+        return payment.id
+
     payment.status = "failed"
     # Pinch's code, preserved verbatim. failure_class stays NULL — deriving it
     # is Person B's classifier, and a guess written here would be

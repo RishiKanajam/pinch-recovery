@@ -2,41 +2,99 @@
 {% set page = 'dashboard' %}
 {% block title %}Dashboard · Pinch Recovery{% endblock %}
 
+{% block head_extra %}
+<style>
+/* The hero is the recovered figure. Everything else on this page explains it,
+   so nothing else on the page is allowed to compete with it for size. */
+.hero {
+  display: grid; grid-template-columns: minmax(300px, 1.15fr) 1fr;
+  gap: 14px; align-items: stretch; margin: 22px 0 12px;
+}
+@media (max-width: 860px) { .hero { grid-template-columns: 1fr; } }
+.hero-main {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--ok) 11%, var(--surface)), var(--surface));
+  border: 1px solid color-mix(in srgb, var(--ok) 34%, var(--line));
+  border-radius: var(--radius); padding: 22px 24px 20px;
+  display: flex; flex-direction: column; justify-content: center;
+}
+.hero-main .k {
+  color: var(--ok); font-size: 12px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .07em;
+  display: flex; align-items: center; gap: 8px;
+}
+.hero-main .v {
+  font-size: 58px; line-height: 1.04; font-weight: 680; letter-spacing: -0.035em;
+  color: var(--ok); font-variant-numeric: tabular-nums; margin: 6px 0 4px;
+  /* The counter climbs during the demo; a proportional font makes every tick
+     reflow the whole line and reads as a glitch rather than as progress. */
+}
+@media (max-width: 480px) { .hero-main .v { font-size: 42px; } }
+.hero-main .n { color: var(--muted); font-size: 13.5px; }
+.hero-main .n b { color: var(--text); font-weight: 600; }
+.live {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 60%, transparent);
+  animation: pulse 2.4s ease-out infinite;
+}
+@keyframes pulse {
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+@media (prefers-reduced-motion: reduce) { .live { animation: none; } }
+
+.hero-side { display: grid; grid-template-rows: repeat(3, 1fr); gap: 10px; }
+.hero-side .stat { display: flex; align-items: baseline; gap: 10px; padding: 12px 15px; }
+.hero-side .stat .v { font-size: 19px; margin: 0; }
+.hero-side .stat .k { margin-right: auto; }
+.hero-side .stat .n { margin: 0; }
+
+td.why { line-height: 1.45; }
+td.why .hl { color: var(--text); }
+td.why .hl .cls { color: var(--muted); }
+</style>
+{% endblock %}
+
 {% block content %}
 <h1>Recovery dashboard</h1>
 <p class="sub">
-  {# Parenthesised deliberately: `x * 100 | round(1)` binds the filter to 100,
-     not to the product, and renders 47.92% instead of 47.9%. #}
-  {{ (summary.recovery_rate * 100) | round(1) }}% of failed money recovered.
-  Every figure below is integer cents in the database.
+  Every figure is integer cents in the database, and every line below says why
+  the engine chose what it chose.
 </p>
 
-<div class="stats">
-  <div class="stat risk">
-    <div class="k">At risk</div>
-    <div class="v">{{ summary.at_risk_cents | money_compact }}</div>
-    <div class="n">still in flight</div>
+<section class="hero">
+  <div class="hero-main">
+    <div class="k"><span class="live" aria-hidden="true"></span> Recovered</div>
+    {# Rendered server-side and correct without JavaScript; the script below
+       only keeps it climbing while a fast-forward runs. #}
+    <div class="v" id="recovered-total"
+         data-cents="{{ summary.recovered_cents }}">{{ summary.recovered_cents | money }}</div>
+    <div class="n">
+      {# Parenthesised deliberately: `x * 100 | round(1)` binds the filter to
+         100, not to the product, and renders 47.92% instead of 47.9%. #}
+      <b id="recovered-rate">{{ (summary.recovery_rate * 100) | round(1) }}%</b>
+      of the {{ (summary.at_risk_cents + summary.recovered_cents + summary.written_off_cents) | money }}
+      that failed, put back
+    </div>
   </div>
-  <div class="stat ok">
-    <div class="k">Recovered</div>
-    <div class="v">{{ summary.recovered_cents | money_compact }}</div>
-    <div class="n">failed, then succeeded</div>
+
+  <div class="hero-side">
+    <div class="stat risk">
+      <div class="k">At risk</div>
+      <div class="v">{{ summary.at_risk_cents | money_compact }}</div>
+      <div class="n">still in flight</div>
+    </div>
+    <div class="stat warn">
+      <div class="k">With a human</div>
+      <div class="v">{{ summary.escalated_cents | money_compact }}</div>
+      <div class="n">a subset of at-risk</div>
+    </div>
+    <div class="stat dead">
+      <div class="k">Written off</div>
+      <div class="v">{{ summary.written_off_cents | money_compact }}</div>
+      <div class="n">past the horizon</div>
+    </div>
   </div>
-  <div class="stat warn">
-    <div class="k">Escalated</div>
-    <div class="v">{{ summary.escalated_cents | money_compact }}</div>
-    <div class="n">waiting on a human</div>
-  </div>
-  <div class="stat dead">
-    <div class="k">Written off</div>
-    <div class="v">{{ summary.written_off_cents | money_compact }}</div>
-    <div class="n">past the 21-day horizon</div>
-  </div>
-</div>
-<p class="sub" style="margin-top:10px;font-size:12.5px;color:var(--faint)">
-  Escalated is a subset of at-risk, not a separate bucket — a payment waiting on a
-  human is still unrecovered.
-</p>
+</section>
 
 <h2>By failure class</h2>
 <div class="classes">
@@ -68,16 +126,17 @@
 </h2>
 
 <div class="filters">
-  <a class="chip {% if not selected_status %}on{% endif %}"
-     href="/{% if selected_class %}?failure_class={{ selected_class.value }}{% endif %}">All statuses</a>
-  {% for s in statuses %}
-    {% if s.value != 'pending' and s.value != 'succeeded' %}
-    <a class="chip {% if selected_status and selected_status.value == s.value %}on{% endif %}"
-       href="/?status={{ s.value }}{% if selected_class %}&failure_class={{ selected_class.value }}{% endif %}">{{ s | status_label }}</a>
-    {% endif %}
+  {# Three ways out of the worklist, plus what is still in it. Written-off is
+     a filter of equal standing with recovered on purpose — a dashboard that
+     only surfaces its wins is not showing you the engine's judgement. #}
+  <a class="chip {% if not selected_outcome %}on{% endif %}"
+     href="/{% if selected_class %}?failure_class={{ selected_class.value }}{% endif %}">Everything</a>
+  {% for state, label in end_states %}
+  <a class="chip {% if selected_outcome == state %}on{% endif %}"
+     href="/?outcome={{ state }}{% if selected_class %}&failure_class={{ selected_class.value }}{% endif %}">{{ label }}</a>
   {% endfor %}
   {% if selected_class %}
-    <a class="chip" href="/{% if selected_status %}?status={{ selected_status.value }}{% endif %}">✕ {{ selected_class | class_label }}</a>
+    <a class="chip" href="/{% if selected_outcome %}?outcome={{ selected_outcome }}{% endif %}">✕ {{ selected_class | class_label }}</a>
   {% endif %}
 </div>
 
@@ -88,20 +147,24 @@
       <th>Customer</th>
       <th class="r">Amount</th>
       <th>Code</th>
-      <th>Class</th>
-      <th>Status</th>
-      <th>Why this decision</th>
+      <th>End state</th>
+      <th>What the engine is doing, and why</th>
     </tr>
   </thead>
   <tbody>
     {% for p in payments %}
+    {% set state = p | end_state %}
     <tr onclick="location.href='/payments/{{ p.id }}'" style="cursor:pointer">
       <td class="who"><a href="/payments/{{ p.id }}">{{ p.customer_name }}</a></td>
       <td class="amt r">{{ p.amount_cents | money }}</td>
       <td><span class="code">{{ p.raw_code or '—' }}</span></td>
-      <td>{{ p.failure_class | class_label }}</td>
-      <td><span class="pill {{ p.status.value }}">{{ p.status | status_label }}</span></td>
-      <td class="why">{{ p.reasoning | truncate(96, True) }}</td>
+      <td>
+        <span class="pill {{ p.status.value }}{% if state[0] == 'escalated' %} hard{% endif %}"
+              title="{{ state[1] }}">{{ state[0] | end_state_label }}</span>
+      </td>
+      {# The one-line trace. The full paragraph is a click away; this is what
+         has to survive being read at a glance, fifty rows at a time. #}
+      <td class="why"><span class="hl">{{ p | headline }}</span></td>
     </tr>
     {% endfor %}
   </tbody>
@@ -109,4 +172,49 @@
 {% else %}
 <div class="empty">No payments match this filter.</div>
 {% endif %}
+
+<script>
+// Progressive enhancement only: the figure above is already rendered and
+// correct. This keeps it climbing while a fast-forward settles retries in the
+// background, which is the moment the demo is built around — a number that
+// moves on its own says "this is running" in a way a static one cannot.
+(function () {
+  var el = document.getElementById('recovered-total');
+  var rate = document.getElementById('recovered-rate');
+  if (!el || !window.fetch) return;
+
+  var money = new Intl.NumberFormat('en-AU', {
+    style: 'currency', currency: 'AUD'
+  });
+  var shown = parseInt(el.dataset.cents, 10) || 0;
+  var target = shown;
+  var timer = null;
+
+  function step() {
+    // Ease toward the target so a $1,200 jump reads as a climb rather than a
+    // jump cut, and stop cleanly instead of asymptoting forever.
+    var gap = target - shown;
+    if (Math.abs(gap) < 50) { shown = target; }
+    else { shown += Math.ceil(gap / 8); }
+    el.textContent = money.format(shown / 100);
+    if (shown !== target) { requestAnimationFrame(step); }
+    else { timer = null; }
+  }
+
+  function poll() {
+    fetch('/api/v1/dashboard/summary', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (!data) return;
+        if (rate) rate.textContent = (data.recovery_rate * 100).toFixed(1) + '%';
+        if (data.recovered_cents === target) return;
+        target = data.recovered_cents;
+        if (!timer) { timer = true; requestAnimationFrame(step); }
+      })
+      .catch(function () { /* a failed poll is not worth a broken page */ });
+  }
+
+  setInterval(poll, 2000);
+})();
+</script>
 {% endblock %}

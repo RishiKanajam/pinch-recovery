@@ -414,6 +414,16 @@ class Repository:
         and after every fast-forward.
 
         Idempotent: an attempt only leaves `scheduled` once.
+
+        Two callers run this concurrently by design — the background poller on
+        its own session, and `/ui/fast-forward` on the request's — so "only
+        once" has to hold across transactions, not just within one. Rows are
+        claimed with `FOR UPDATE SKIP LOCKED`: the second worker to arrive sees
+        the first's rows as taken and moves past them instead of executing them
+        again. Without it both read the same `scheduled` attempt before either
+        commits, and the visible symptom is a duplicate-key crash on the outbox
+        insert — the polite version. The impolite one is two identical debits
+        presented to Pinch for one scheduled retry.
         """
         now = clock.now()
         executed = 0
@@ -431,6 +441,10 @@ class Repository:
                     ),
                 )
                 .order_by(AttemptRow.scheduled_for)
+                # `of=` limits the lock to the attempts themselves: locking the
+                # joined payment too would block a second worker from touching
+                # any other attempt belonging to the same payment.
+                .with_for_update(skip_locked=True, of=AttemptRow)
             )
             .scalars()
             .all()

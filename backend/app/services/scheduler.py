@@ -13,7 +13,7 @@ import logging
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta, timezone
 
-from app.core import clock
+from app.core import clock, holidays
 from app.models.enums import AttemptStatus
 from app.models.schemas import Attempt, Payment
 
@@ -64,6 +64,42 @@ def next_payday(after: datetime, weekdays: Sequence[int]) -> datetime:
 def hours_from(base: datetime, hours: int) -> datetime:
     """`base` plus `hours`, always timezone-aware UTC."""
     return (base + timedelta(hours=hours)).astimezone(timezone.utc)
+
+
+def next_month_equivalent(after: datetime) -> datetime:
+    """Same day next month, at the same time of day, in AEST.
+
+    Used for the third attempt on a monthly payer: someone billed on the 15th
+    is paid on a monthly rhythm, so the useful next window is next month's
+    15th, not the payday five days from now. Clamped for short months — the
+    31st of a month with 30 days lands on the 30th, not the 1st, because
+    rolling into the next month would push the attempt past the write-off
+    horizon and silently drop it.
+    """
+    local = after.astimezone(AEST)
+    year = local.year + (local.month == 12)
+    month = local.month % 12 + 1
+    # 28 is safe in every month; walk up to the requested day and stop at the
+    # last valid one.
+    day = local.day
+    while day > 28:
+        try:
+            local.replace(year=year, month=month, day=day)
+            break
+        except ValueError:
+            day -= 1
+    return local.replace(year=year, month=month, day=day).astimezone(timezone.utc)
+
+
+def business_day(at: datetime) -> tuple[datetime, str | None]:
+    """`at`, moved forward off weekends and public holidays.
+
+    Returns the time and what it moved off, or None when it did not move.
+    Banks do not process a BECS file on a Sunday or on Anzac Day, so a debit
+    scheduled then is presented whenever the bank next opens — scheduling it
+    there ourselves keeps the date we show and the date it happens identical.
+    """
+    return holidays.roll_to_business_day(at, AEST)
 
 
 def due_attempts(payments: Iterable[Payment], now: datetime | None = None) -> list[Attempt]:

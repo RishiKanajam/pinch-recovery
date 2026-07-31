@@ -13,6 +13,25 @@
 .cols { display: grid; grid-template-columns: 1.35fr 1fr; gap: 14px; align-items: start; margin-top: 18px; }
 @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
 
+/* end state: recovered / with a human / written off, each with its reason */
+.endstate {
+  display: flex; gap: 16px; align-items: center; margin-top: 16px;
+  background: var(--surface); border: 1px solid var(--line);
+  border-left: 3px solid var(--edge, var(--faint));
+  border-radius: var(--radius); padding: 14px 18px;
+}
+.endstate .lbl {
+  font-size: 11.5px; font-weight: 700; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--edge, var(--muted)); white-space: nowrap;
+  min-width: 104px;
+}
+.endstate .hl { font-size: 15px; font-weight: 550; }
+.endstate .rsn { color: var(--muted); font-size: 13px; margin-top: 3px; line-height: 1.5; }
+.endstate.recovered { --edge: var(--ok); }
+.endstate.escalated { --edge: var(--warn); }
+.endstate.written_off { --edge: var(--dead); }
+.endstate.in_flight { --edge: var(--accent); }
+
 /* the reasoning panel is the thing the judge reads, so it gets the emphasis */
 .reasoning {
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
@@ -102,7 +121,18 @@
   </div>
 </div>
 
-<div class="reasoning" style="margin-top:16px">
+{% set state = payment | end_state %}
+<div class="endstate {{ state[0] }}">
+  <div class="lbl">{{ state[0] | end_state_label }}</div>
+  <div>
+    {# The one-liner first, because it is the sentence a judge repeats back.
+       The reason underneath is what makes it defensible rather than glib. #}
+    <div class="hl">{{ payment | headline }}</div>
+    <div class="rsn">{{ state[1] }}</div>
+  </div>
+</div>
+
+<div class="reasoning" style="margin-top:14px">
   <h3>Why the system did this</h3>
   <p>{{ payment.reasoning }}</p>
 </div>

@@ -11,6 +11,7 @@ without Pinch credentials.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -22,10 +23,24 @@ from sqlalchemy.orm import Session
 from app.core import clock
 from app.core.config import settings
 from app.core.db import SessionLocal
+from app.core.ids import new_id
 from app.models.customer import Customer
 from app.models.payment import Payment
 
+logger = logging.getLogger(__name__)
+
 PINCH_DOCS = "https://docs.getpinch.com.au"
+PINCH_TEST_BASE = "https://api.getpinch.com.au/test/"
+
+# Documented test bank account — see the Test and Live Mode guide. Any BSB and
+# account number are accepted in test mode; using the ones the docs name keeps
+# a failure attributable to credentials or environment rather than to data.
+TEST_BSB = "000-000"
+# Nine digits, not the ten printed on the docs page. Pinch's test-data table
+# lists `0000000000`, but the API validates `BankAccountNumber` at 3-9 digits
+# and rejects it with a 400 — verified against the sandbox on 2026-07-31. The
+# docs and the API disagree; the API is the one that answers on demo night.
+TEST_ACCOUNT_NUMBER = "000000000"
 
 # Refresh a token this long before it actually expires, so one never dies
 # between the check and the request.
@@ -62,6 +77,35 @@ class PaymentMethodResult:
     account_last4: str | None = None
     error_code: str | None = None
     message: str = ""
+
+
+@dataclass(frozen=True)
+class TestPaymentResult:
+    """A payment created in Pinch's test environment to force a dishonour.
+
+    `forced_code` is the code the sandbox was asked to fail with. Like a
+    retry, the failure itself does not come back from this call — it arrives on
+    the next `bank-results` event, which is the whole point: the loop under
+    demonstration is the real one, not a shortcut that writes the dishonour
+    straight into our own database.
+    """
+
+    accepted: bool
+    forced_code: str | None = None
+    pinch_payment_id: str | None = None
+    pinch_payer_id: str | None = None
+    customer_id: str | None = None
+    error_code: str | None = None
+    message: str = ""
+
+
+@dataclass(frozen=True)
+class EventSummary:
+    """One row of `GET /events` — enough to decide whether to fetch the rest."""
+
+    id: str
+    type: str
+    event_date: str | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +147,38 @@ class PinchClient(ABC):
         """Replace a customer's bank details.
 
         `details` carries `account_name`, `bsb`, and `account_number`.
+        """
+
+    @abstractmethod
+    def create_test_payment(
+        self,
+        *,
+        amount_cents: int,
+        raw_code: str | None,
+        customer_id: str | None = None,
+        customer_name: str | None = None,
+        description: str | None = None,
+    ) -> TestPaymentResult:
+        """Present a debit that will fail with `raw_code`.
+
+        The demo's entry point. In mock mode the simulator produces the
+        dishonour; in live mode Pinch's test environment does, triggered by the
+        code embedded in the description. Either way the failure comes back
+        through ingest as an event, never as a return value.
+        """
+
+    @abstractmethod
+    def list_events(
+        self, event_type: str | None = None, page: int = 1, page_size: int = 50
+    ) -> list[EventSummary]:
+        """Recent events, newest first. The poll half of ingest."""
+
+    @abstractmethod
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        """One event's full envelope, in the shape `/webhooks/pinch` ingests.
+
+        `GET /events` returns summaries only — `metadata`, not `data` — so the
+        payments in a batch are not visible until the event is fetched by id.
         """
 
 
@@ -357,6 +433,120 @@ class MockPinchClient(PinchClient):
             account_last4=last4,
             message="Payment method updated.",
         )
+
+    def create_test_payment(
+        self,
+        *,
+        amount_cents: int,
+        raw_code: str | None,
+        customer_id: str | None = None,
+        customer_name: str | None = None,
+        description: str | None = None,
+    ) -> TestPaymentResult:
+        """Queue a simulated dishonour, settling after the usual delay.
+
+        Deliberately not a shortcut: this writes a pending `bank-results`
+        webhook rather than a failed payment row, so the payment appears only
+        once ingest has processed the event — the same order of operations the
+        live path has.
+        """
+        self.calls.append(
+            OutboundCall(
+                "create_test_payment",
+                {"amount_cents": amount_cents, "raw_code": raw_code},
+            )
+        )
+
+        from app.sim import service
+        from app.sim.schemas import ScenarioRequest
+
+        with self._session_factory() as session:
+            created = service.create_scenario(
+                session,
+                ScenarioRequest(
+                    customer_id=customer_id,
+                    customer_name=customer_name,
+                    amount_cents=amount_cents,
+                    outcome="dishonour" if raw_code else "success",
+                    raw_code=raw_code,
+                    delay_seconds=int(service.SETTLEMENT_SECONDS),
+                ),
+            )
+
+        return TestPaymentResult(
+            accepted=True,
+            forced_code=raw_code,
+            pinch_payment_id=created["payment_id"],
+            customer_id=created["customer_id"],
+            message=(
+                "Simulated debit queued; the dishonour arrives on the next "
+                "bank-results event once the settlement window has passed."
+            ),
+        )
+
+    def list_events(
+        self, event_type: str | None = None, page: int = 1, page_size: int = 50
+    ) -> list[EventSummary]:
+        """The simulator's queue, as event summaries.
+
+        Only events whose delivery time has arrived are listed, so a poll
+        behaves like Pinch's — a settlement three days out is not visible until
+        the clock (or a fast-forward) reaches it.
+        """
+        from sqlalchemy import select as sa_select
+
+        from app.models.sim_webhook import SimulatedWebhook
+
+        with self._session_factory() as session:
+            rows = (
+                session.execute(
+                    sa_select(SimulatedWebhook)
+                    .where(SimulatedWebhook.deliver_at <= clock.now())
+                    .order_by(SimulatedWebhook.deliver_at.desc())
+                    .limit(page_size * page)
+                )
+                .scalars()
+                .all()
+            )
+
+        seen: set[str] = set()
+        summaries: list[EventSummary] = []
+        for row in rows:
+            # Duplicate deliveries share one event_id; the list endpoint
+            # reports events, not deliveries.
+            if row.event_id in seen:
+                continue
+            seen.add(row.event_id)
+            payload = row.payload or {}
+            row_type = payload.get("Type") or payload.get("type") or ""
+            if event_type is not None and row_type != event_type:
+                continue
+            summaries.append(
+                EventSummary(
+                    id=row.event_id,
+                    type=row_type,
+                    event_date=payload.get("EventDate") or payload.get("eventDate"),
+                )
+            )
+        return summaries[(page - 1) * page_size : page * page_size]
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        from sqlalchemy import select as sa_select
+
+        from app.models.sim_webhook import SimulatedWebhook
+
+        with self._session_factory() as session:
+            row = (
+                session.execute(
+                    sa_select(SimulatedWebhook)
+                    .where(SimulatedWebhook.event_id == event_id)
+                    .order_by(SimulatedWebhook.delivery_number)
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+        return row.payload if row is not None else None
 
 
 # --------------------------------------------------------------------------
@@ -670,6 +860,170 @@ class LivePinchClient(PinchClient):
             account_last4=last4,
             message="Payment method updated.",
         )
+
+    # -- test payments -----------------------------------------------------
+
+    def create_test_payment(
+        self,
+        *,
+        amount_cents: int,
+        raw_code: str | None,
+        customer_id: str | None = None,
+        customer_name: str | None = None,
+        description: str | None = None,
+    ) -> TestPaymentResult:
+        """Present a real debit in Pinch's test environment, forced to fail.
+
+        Verified against https://docs.getpinch.com.au/docs/test-and-live-mode
+        on 2026-07-31: the sandbox dishonours a payment with a specific code
+        when that code appears anywhere in the `description` (or the payer's
+        `firstName`) prefixed with `#`. Nothing about the request is otherwise
+        special — it is an ordinary `POST /payments`, and the dishonour comes
+        back on a `bank-results` event like any other.
+
+        Refused outright against the live base URL. There is no such thing as
+        a forced dishonour in production: the same call would debit a real
+        person, and one environment variable is all that separates the two.
+        """
+        if settings.targets_live_money:
+            return TestPaymentResult(
+                accepted=False,
+                error_code="live_environment",
+                message=(
+                    "PINCH_API_BASE points at /live/. Forcing a dishonour there "
+                    "would present a real debit against a real account. Point at "
+                    f"{PINCH_TEST_BASE} first."
+                ),
+            )
+
+        note = description or "Recovery engine test payment"
+        if raw_code:
+            # The `#code` is the whole mechanism. It stays at the end so the
+            # human-readable part of the description reads first in the portal.
+            note = f"{note} #{raw_code}"
+
+        with self._session_factory() as session:
+            customer = (
+                session.get(Customer, customer_id) if customer_id else None
+            )
+            if customer is None:
+                customer = Customer(
+                    id=customer_id or new_id("cus"),
+                    name=customer_name or "Pinch sandbox customer",
+                    email=f"{new_id('sandbox')}@mailinator.com",
+                )
+                session.add(customer)
+                session.flush()
+
+            try:
+                if not customer.pinch_payer_id:
+                    payer = self._request(
+                        "POST",
+                        "/payers",
+                        json={
+                            "firstName": customer.name or "Customer",
+                            "emailAddress": customer.email
+                            or f"{customer.id}@example.invalid",
+                        },
+                    ).json()
+                    customer.pinch_payer_id = payer["id"]
+
+                if not customer.pinch_source_id:
+                    # Documented test bank account. Any BSB/account is accepted
+                    # in test mode; these are the values the docs name, so a
+                    # failure here is a credential or environment problem
+                    # rather than a data one.
+                    source = self._request(
+                        "POST",
+                        f"/payers/{customer.pinch_payer_id}/sources",
+                        json={
+                            "sourceType": "bank-account",
+                            "bankAccountName": customer.name or "Test Account",
+                            "bankAccountBsb": TEST_BSB,
+                            "bankAccountNumber": TEST_ACCOUNT_NUMBER,
+                        },
+                    ).json()
+                    customer.pinch_source_id = source["id"]
+                    customer.bank_account_name = customer.name
+                    customer.bank_bsb = TEST_BSB
+                    customer.bank_account_last4 = TEST_ACCOUNT_NUMBER[-4:]
+
+                body: dict[str, Any] = {
+                    "payerId": customer.pinch_payer_id,
+                    "sourceId": customer.pinch_source_id,
+                    "amount": amount_cents,
+                    "description": note,
+                    # Today, so a Time-Travel'd poll past tonight's processing
+                    # run picks the result up rather than waiting a day.
+                    "transactionDate": clock.now().date().isoformat(),
+                }
+                created = self._request("POST", "/payments", json=body).json()
+            except httpx.HTTPStatusError as exc:
+                session.rollback()
+                return TestPaymentResult(
+                    accepted=False,
+                    forced_code=raw_code,
+                    error_code=f"http_{exc.response.status_code}",
+                    message=exc.response.text,
+                )
+
+            result = TestPaymentResult(
+                accepted=True,
+                forced_code=raw_code,
+                pinch_payment_id=created.get("id"),
+                pinch_payer_id=customer.pinch_payer_id,
+                customer_id=customer.id,
+                message=(
+                    "Debit submitted to the Pinch test environment. The forced "
+                    "dishonour arrives on a bank-results event after the "
+                    "processing run — poll for it, or Time-Travel past tonight."
+                ),
+            )
+            session.commit()
+
+        return result
+
+    # -- events ------------------------------------------------------------
+
+    def list_events(
+        self, event_type: str | None = None, page: int = 1, page_size: int = 50
+    ) -> list[EventSummary]:
+        """`GET /events`. Newest first, summaries only.
+
+        Verified against https://docs.getpinch.com.au/reference/list-all-events
+        on 2026-07-31: `page`, `pageSize` (max 500), and a single `eventType`
+        filter. Entries carry `metadata` — a quick-reference summary — and not
+        `data`, so the payments in a batch need `get_event`.
+        """
+        params: dict[str, Any] = {"page": page, "pageSize": min(page_size, 500)}
+        if event_type:
+            params["eventType"] = event_type
+
+        try:
+            payload = self._request("GET", "/events", params=params).json()
+        except httpx.HTTPStatusError:
+            # A poll that raises takes the ingest loop down; one that returns
+            # nothing is retried on the next tick.
+            logger.exception("Listing Pinch events failed")
+            return []
+
+        return [
+            EventSummary(
+                id=str(item.get("id")),
+                type=str(item.get("type") or ""),
+                event_date=item.get("eventDate"),
+            )
+            for item in payload.get("data") or []
+            if item.get("id")
+        ]
+
+    def get_event(self, event_id: str) -> dict[str, Any] | None:
+        """`GET /events/{id}` — the full envelope, `data` included."""
+        try:
+            return self._request("GET", f"/events/{event_id}").json()
+        except httpx.HTTPStatusError:
+            logger.exception("Fetching Pinch event %s failed", event_id)
+            return None
 
 
 # --------------------------------------------------------------------------

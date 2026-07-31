@@ -37,6 +37,11 @@ class ActionType(str, Enum):
     REQUEST_DETAILS_UPDATE = "request_details_update"
     NOTIFY_HUMAN = "notify_human"
     SAVE_OFFER = "save_offer"
+    # Offer to break the outstanding amount into instalments. Reached only
+    # after repeated insufficient-funds dishonours, where the evidence says the
+    # customer wants to pay and cannot clear the full amount in one debit —
+    # presenting the same figure a fourth time is the definition of a cron job.
+    OFFER_SPLIT = "offer_split"
     WRITE_OFF = "write_off"
     NONE = "none"
 

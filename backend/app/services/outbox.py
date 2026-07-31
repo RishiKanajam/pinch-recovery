@@ -16,6 +16,7 @@ from datetime import datetime
 
 from app.models.enums import ActionType, Channel, FailureClass
 from app.models.schemas import Attempt, OutboxMessage, Payment
+from app.services.strategy_engine import split_halves
 
 
 def _money(cents: int) -> str:
@@ -94,6 +95,34 @@ def _save_offer_email(payment: Payment) -> tuple[str, str]:
     )
 
 
+def _split_offer_email(payment: Payment) -> tuple[str, str]:
+    """Sent after repeated insufficient-funds dishonours.
+
+    The evidence at this point is that the customer wants to pay and cannot
+    clear the full amount in one debit. Presenting the same figure a third time
+    is what a dunning tool does; offering it in two is the only step here that
+    changes the odds.
+    """
+    first, second = split_halves(payment.amount_cents)
+    return (
+        f"Would splitting {_money(payment.amount_cents)} help?",
+        (
+            f"Hi {payment.customer_name},\n\n"
+            f"We've tried your {_money(payment.amount_cents)} payment twice now, "
+            "both times on a payday, and both times the bank returned it short. "
+            "We're not going to keep presenting the same amount and charging you "
+            "dishonour fees for it.\n\n"
+            "If it's easier, we can split it in two:\n\n"
+            f"  • {_money(first)} on your next payday\n"
+            f"  • {_money(second)} the payday after\n\n"
+            "Reply and we'll set that up — or if now works, you can pay the "
+            "whole thing or update your account details using the link below.\n\n"
+            "Nothing about your service changes in the meantime.\n\n"
+            "— Accounts"
+        ),
+    )
+
+
 def _expired_card_email(payment: Payment) -> tuple[str, str]:
     return (
         "Your card needs updating",
@@ -125,6 +154,7 @@ def _neutral_details_email(payment: Payment) -> tuple[str, str]:
 # than for an expired card.
 _COPY = {
     (FailureClass.INSUFFICIENT_FUNDS, ActionType.REQUEST_DETAILS_UPDATE): _soft_funds_email,
+    (FailureClass.INSUFFICIENT_FUNDS, ActionType.OFFER_SPLIT): _split_offer_email,
     (FailureClass.INVALID_ACCOUNT, ActionType.REQUEST_DETAILS_UPDATE): _urgent_invalid_account_email,
     (FailureClass.AUTHORITY_CANCELLED, ActionType.SAVE_OFFER): _save_offer_email,
     (FailureClass.EXPIRED_CARD, ActionType.REQUEST_DETAILS_UPDATE): _expired_card_email,

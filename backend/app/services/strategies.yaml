@@ -24,10 +24,20 @@ classes:
         channel: email
         delay_hours: 0
         tone: soft
+      # Anchored to the last scheduled retry by the engine, not to this figure:
+      # the offer only makes sense once the earlier attempts have actually
+      # failed. delay_hours is the floor, not the date.
+      - action: offer_split
+        channel: email
+        delay_hours: 240
+        tone: soft
     reasoning: >
       Funds were unavailable at the time of debit. Retrying on the customer's
       observed payday materially improves success rate versus a fixed interval.
-      Messaging stays soft — this customer is not churning.
+      Messaging stays soft — this customer is not churning. If two payday-timed
+      attempts both come back short, the amount is the problem rather than the
+      timing, and the customer is offered the balance in instalments before
+      anyone gives up on it.
 
   invalid_account:
     raw_codes: ["invalid-account"]
@@ -159,8 +169,23 @@ global_rules:
   min_hours_between_customer_messages: 24
 
   # Retries align to these weekdays when align_to_payday is set and we have no
-  # per-customer history. 3 = Thursday, 4 = Friday (Mon=0).
+  # per-customer history. 3 = Thursday, 4 = Friday (Mon=0). Every retry is then
+  # rolled off weekends and AU public holidays to the next business day — a
+  # BECS file is not processed on Anzac Day, so scheduling one there would mean
+  # the date we show and the date it happens are different things.
   default_payday_weekdays: [3, 4]
 
   # After this long with no recovery, write off and stop.
   write_off_after_days: 21
+
+  # --- monthly payers ---
+  # A debit this size reads as a monthly bill rather than a weekly service, so
+  # after two payday attempts the ladder steps to their next equivalent date
+  # instead of a third attempt on a rhythm that has already failed twice. This
+  # is a heuristic on the amount, not a learned per-customer model — see
+  # `looks_monthly` in strategy_engine.py and the roadmap note in the README.
+  monthly_payer_min_cents: 15000
+  monthly_escalation_attempt: 3
+  # Only applied when that monthly attempt is actually scheduled: writing off
+  # at 21 days would close the file days before the one date likely to work.
+  monthly_payer_write_off_days: 35

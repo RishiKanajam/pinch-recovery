@@ -18,6 +18,7 @@ import pytest
 from sqlalchemy import select
 
 from app.core import clock
+from app.models import Attempt as AttemptRow
 from app.models import Payment as PaymentRow
 from app.models.enums import ActionType, AttemptStatus, FailureClass, PaymentStatus
 from app.services.repository import Repository
@@ -434,6 +435,47 @@ def test_execute_due_is_idempotent(client, store, db_session):
     # Second call with no further time passing must be a no-op: an attempt
     # leaves `scheduled` exactly once, or the outbox fills with duplicates.
     assert repo.execute_due() == 0
+
+
+def test_work_claimed_by_another_worker_is_skipped_not_repeated(
+    client, store, db_session, engine
+):
+    """Two workers run this concurrently: the poller, and /ui/fast-forward.
+
+    "Executed once" therefore has to hold across transactions. Here the first
+    session claims every due attempt and holds the lock open, standing in for a
+    poller tick mid-flight; the second must find nothing to do rather than
+    executing the same attempts again. Before the row lock the second worker
+    read the same `scheduled` rows, sent the same messages, and crashed on the
+    duplicate outbox id — with a 500 on the button the demo is driven from.
+    """
+    from sqlalchemy.orm import sessionmaker
+
+    clock.fast_forward(60 * 60 * 24 * 6)
+
+    claimant = sessionmaker(bind=engine, expire_on_commit=False)()
+    try:
+        claimed = (
+            claimant.execute(
+                select(AttemptRow)
+                .where(
+                    AttemptRow.status == AttemptStatus.SCHEDULED.value,
+                    AttemptRow.scheduled_for.is_not(None),
+                    AttemptRow.scheduled_for <= clock.now(),
+                )
+                .with_for_update(skip_locked=True, of=AttemptRow)
+            )
+            .scalars()
+            .all()
+        )
+        assert claimed, "the fixture must have due work for this to mean anything"
+
+        # The lock is held until the claimant commits, so this is the exact
+        # window in which the second worker used to duplicate the batch.
+        assert Repository(db_session).execute_due() == 0
+    finally:
+        claimant.rollback()
+        claimant.close()
 
 
 def test_fast_forward_eventually_writes_off_unrecovered_payments(
