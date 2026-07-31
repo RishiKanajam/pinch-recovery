@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from time import monotonic
 
 from fastapi import FastAPI, HTTPException
 
 from app.api.payments import router as payments_router
+from app.api.pinch import router as pinch_router
 from app.api.webhooks import router as webhooks_router
 from app.core import clock
 from app.core.config import settings
@@ -28,6 +30,7 @@ from app.core.db import SessionLocal
 from app.routers.api import contract_error_handler
 from app.routers.api import router as recovery_router
 from app.routers.web import router as web_router
+from app.services import event_ingest
 from app.services.classifier import get_strategy_table
 from app.services.repository import Repository
 from app.services.scheduler import DueActionPoller
@@ -40,19 +43,54 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _poller: DueActionPoller | None = None
+_last_event_poll: float = 0.0
+
+
+def _due_for_event_poll() -> bool:
+    """Whether enough real seconds have passed to ask Pinch for new events.
+
+    Real seconds, not simulated ones: this is rate-limiting an outbound HTTP
+    call, and a fast-forward must not turn one demo keypress into a burst of
+    requests at Pinch. It is the one place in the codebase that legitimately
+    reads the wall clock, which is why it lives here rather than in the poller.
+    """
+    global _last_event_poll
+
+    elapsed = monotonic() - _last_event_poll
+    if elapsed < settings.PINCH_POLL_SECONDS:
+        return False
+    _last_event_poll = monotonic()
+    return True
 
 
 def _execute_due_actions() -> int:
-    """Poller tick: run whatever the simulated clock has made due.
+    """Poller tick: ingest anything new, then run whatever is due.
 
     Opens its own session rather than borrowing a request's — there is no
     request. Person A's `/sim/fast-forward` reports due attempts but does not
     execute them, on the grounds that applying retry budgets and max_attempts
     belongs to the engine; this is the other half of that handshake.
+
+    In live mode the tick also polls `GET /events`, so the loop closes without
+    a public URL for webhooks: a dishonour raised in the Pinch sandbox lands on
+    the dashboard on its own, classified, within a poll interval.
     """
     db = SessionLocal()
     try:
-        return Repository(db).execute_due()
+        store = Repository(db)
+        worked = 0
+
+        if (
+            settings.PINCH_MODE == "live"
+            and settings.pinch_credentials_present
+            and _due_for_event_poll()
+        ):
+            result = event_ingest.poll_events(db)
+            worked += len(result["ingested"])
+            if result["ingested"]:
+                store.classify_unclassified()
+
+        return worked + store.execute_due()
     finally:
         db.close()
 
@@ -94,6 +132,7 @@ app = FastAPI(title="Pinch Recovery Engine", version="0.1.0", lifespan=lifespan)
 # Ingestion and simulation (Person A). payments_router first — see module docstring.
 app.include_router(payments_router)
 app.include_router(webhooks_router)
+app.include_router(pinch_router)
 app.include_router(sim_router)
 
 # Engine and interface (Person B).

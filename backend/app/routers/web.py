@@ -26,6 +26,7 @@ from app.core import clock
 from app.core.db import get_db
 from app.models.enums import FailureClass, PaymentStatus
 from app.models.schemas import PaymentMethodUpdate
+from app.services.reasoning import END_STATE_LABELS, build_headline, end_state
 from app.services.repository import Repository
 
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "web" / "templates"
@@ -70,6 +71,7 @@ def _action_label(action) -> str:
         "request_details_update": "Ask for details",
         "notify_human": "Escalate to human",
         "save_offer": "Save offer",
+        "offer_split": "Offer to split",
         "write_off": "Write off",
         "none": "No action",
     }.get(str(value), str(value).replace("_", " ").title())
@@ -80,6 +82,14 @@ templates.env.filters["money_compact"] = _money_compact
 templates.env.filters["class_label"] = _class_label
 templates.env.filters["status_label"] = _status_label
 templates.env.filters["action_label"] = _action_label
+# Derived per render rather than stored: the one-line trace describes the
+# attempt list, and a cached copy would keep promising a retry that was
+# cancelled an hour ago. See app/services/reasoning.py.
+templates.env.filters["headline"] = build_headline
+templates.env.filters["end_state"] = end_state
+templates.env.filters["end_state_label"] = lambda state: END_STATE_LABELS.get(
+    state, state
+)
 
 
 def _base_context(request: Request, store: Repository) -> dict:
@@ -100,6 +110,7 @@ def dashboard(
     request: Request,
     failure_class: str | None = None,
     status: str | None = None,
+    outcome: str | None = None,
     store: Repository = Depends(repo),
 ):
     """The worklist.
@@ -120,6 +131,14 @@ def dashboard(
         status=selected_status, failure_class=selected_class, limit=200
     )
 
+    # End state is derived from the attempt list rather than stored, so it is
+    # filtered here rather than in SQL. "Escalated" in particular is not a
+    # status — a payment waiting on a human is still `failed` — and inventing
+    # a column for it would make it look like one.
+    selected_outcome = outcome if outcome in END_STATE_LABELS else None
+    if selected_outcome:
+        payments = [p for p in payments if end_state(p)[0] == selected_outcome]
+
     context = _base_context(request, store)
     context.update(
         {
@@ -127,6 +146,8 @@ def dashboard(
             "payments": payments,
             "selected_class": selected_class,
             "selected_status": selected_status,
+            "selected_outcome": selected_outcome,
+            "end_states": list(END_STATE_LABELS.items()),
             "statuses": list(PaymentStatus),
             # Widest class bar drives the scale, so the breakdown reads as a
             # comparison rather than eight bars all pinned near full width.

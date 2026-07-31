@@ -7,11 +7,12 @@ failure in one test cannot leave the clock pinned for the next.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from app.core import clock
+from app.core.holidays import holiday_name, is_business_day
 from app.models.enums import (
     HARD_FAILURE_CLASSES,
     ActionType,
@@ -23,10 +24,21 @@ from app.models.enums import (
 from app.models.schemas import Payment
 from app.services.classifier import get_strategy_table
 from app.services.scheduler import AEST, due_attempts, next_payday
-from app.services.strategy_engine import CustomerContext, apply_plan, plan
+from app.services.strategy_engine import (
+    CustomerContext,
+    apply_plan,
+    plan,
+    split_halves,
+)
 
 # A Monday, so weekday arithmetic in the payday tests is easy to reason about.
 FROZEN = datetime(2026, 7, 27, 3, 0, tzinfo=timezone.utc)
+
+# Below global_rules.monthly_payer_min_cents, so the ladder stays on the weekly
+# payday rhythm. Tests about payday alignment and the standard write-off
+# horizon use this: at the default $249 the engine reads a monthly bill and
+# deliberately does something else, which is its own set of tests below.
+WEEKLY_CENTS = 9900
 
 
 @pytest.fixture(autouse=True)
@@ -151,7 +163,11 @@ def test_next_payday_with_no_weekdays_returns_input():
 def test_observed_payday_beats_the_default(table):
     """A customer paid on Tuesday should not be retried on Thursday."""
     customer = CustomerContext(customer_id="cus_01HX0001", payday_weekday=1)
-    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
+    result = plan(
+        make_payment("insufficient-funds", amount_cents=WEEKLY_CENTS),
+        customer=customer,
+        table=table,
+    )
     retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
     assert retries
     for attempt in retries:
@@ -161,7 +177,11 @@ def test_observed_payday_beats_the_default(table):
 
 def test_default_payday_used_without_history(table):
     customer = CustomerContext(customer_id="cus_01HX0001", payday_weekday=None)
-    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
+    result = plan(
+        make_payment("insufficient-funds", amount_cents=WEEKLY_CENTS),
+        customer=customer,
+        table=table,
+    )
     retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
     for attempt in retries:
         assert attempt.scheduled_for.astimezone(AEST).weekday() in (3, 4)
@@ -264,7 +284,9 @@ def test_messages_respect_the_cap_between_each_other(table):
 
 def test_write_off_is_always_scheduled(table):
     rules = table.global_rules
-    result = plan(make_payment("insufficient-funds"), table=table)
+    result = plan(
+        make_payment("insufficient-funds", amount_cents=WEEKLY_CENTS), table=table
+    )
     write_offs = [
         a for a in result.attempts if a.action is ActionType.WRITE_OFF
     ]
@@ -278,7 +300,14 @@ def test_write_off_horizon_measured_from_failure_not_now(table):
     """Re-running recovery on an old payment must not extend its life."""
     rules = table.global_rules
     failed_long_ago = FROZEN - timedelta(days=10)
-    result = plan(make_payment("insufficient-funds", failed_at=failed_long_ago), table=table)
+    result = plan(
+        make_payment(
+            "insufficient-funds",
+            failed_at=failed_long_ago,
+            amount_cents=WEEKLY_CENTS,
+        ),
+        table=table,
+    )
     assert result.write_off_at == failed_long_ago + timedelta(
         days=rules.write_off_after_days
     )
@@ -300,6 +329,160 @@ def test_actions_beyond_horizon_are_skipped_with_a_reason(table):
     assert skipped
     assert all(a.note for a in skipped)
     assert any("horizon" in (a.note or "").lower() for a in skipped)
+
+
+# --- business days -------------------------------------------------------------
+
+
+def test_no_retry_is_ever_scheduled_on_a_non_business_day(table):
+    """Across a year of failure dates, not one retry may land on a shut bank."""
+    for offset in range(0, 365, 7):
+        failed_at = FROZEN + timedelta(days=offset)
+        for code in ("insufficient-funds", "technical-error", "blocked-by-bank"):
+            result = plan(make_payment(code, failed_at=failed_at), table=table)
+            for attempt in result.scheduled_attempts:
+                if attempt.action is not ActionType.RETRY:
+                    continue
+                landed = attempt.scheduled_for.astimezone(AEST).date()
+                assert is_business_day(landed), (
+                    f"{code} failing {failed_at.date()} scheduled a retry on "
+                    f"{landed} ({holiday_name(landed) or 'a weekend'})"
+                )
+
+
+def test_unaligned_retry_rolls_off_a_holiday_and_says_so(table):
+    """technical retries +24h flat, so it lands on whatever the next day is.
+
+    Failing on Sunday 2 August 2026 puts the retry on the Monday, which is the
+    NSW bank holiday — no BECS file is processed, so it moves to the Tuesday.
+    """
+    failed_at = datetime(2026, 8, 2, 18, 0, tzinfo=AEST).astimezone(timezone.utc)
+    result = plan(make_payment("technical-error", failed_at=failed_at), table=table)
+    first = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY][0]
+    assert first.scheduled_for.astimezone(AEST).date() == date(2026, 8, 4)
+    assert "Bank Holiday" in (first.note or "")
+
+
+def test_messages_are_not_rolled_to_business_days(table):
+    """Email is not a bank file. A Saturday notice is fine and better than late."""
+    friday_evening = datetime(2026, 8, 7, 19, 0, tzinfo=AEST).astimezone(timezone.utc)
+    result = plan(make_payment("invalid-account", failed_at=friday_evening), table=table)
+    messages = [
+        a
+        for a in result.scheduled_attempts
+        if a.action is ActionType.REQUEST_DETAILS_UPDATE
+    ]
+    assert messages
+    assert not any("Rolled forward" in (a.note or "") for a in messages)
+
+
+# --- monthly payers ------------------------------------------------------------
+
+
+def test_third_attempt_steps_to_next_month_for_a_monthly_sized_bill(table):
+    rules = table.global_rules
+    result = plan(
+        make_payment("insufficient-funds", amount_cents=34900), table=table
+    )
+    retries = sorted(
+        (a for a in result.scheduled_attempts if a.action is ActionType.RETRY),
+        key=lambda a: a.scheduled_for,
+    )
+    assert len(retries) >= rules.monthly_escalation_attempt
+
+    third = retries[rules.monthly_escalation_attempt - 1]
+    assert "next month" in (third.note or "").lower()
+    # A month out, not another five-day step.
+    assert third.scheduled_for - retries[1].scheduled_for >= timedelta(days=14)
+
+
+def test_monthly_escalation_extends_the_horizon_that_would_have_dropped_it(table):
+    """The extension exists so the monthly attempt is not scheduled then skipped."""
+    rules = table.global_rules
+    result = plan(make_payment("insufficient-funds", amount_cents=34900), table=table)
+
+    assert result.write_off_at == FROZEN + timedelta(
+        days=rules.monthly_payer_write_off_days
+    )
+    monthly = [
+        a
+        for a in result.scheduled_attempts
+        if a.action is ActionType.RETRY and "next month" in (a.note or "").lower()
+    ]
+    assert monthly, "the monthly attempt must survive the horizon it triggered"
+    assert all(a.scheduled_for <= result.write_off_at for a in monthly)
+
+
+def test_a_weekly_sized_bill_keeps_the_standard_horizon_and_ladder(table):
+    rules = table.global_rules
+    result = plan(
+        make_payment("insufficient-funds", amount_cents=WEEKLY_CENTS), table=table
+    )
+    assert result.write_off_at == FROZEN + timedelta(days=rules.write_off_after_days)
+    assert not any(
+        "next month" in (a.note or "").lower() for a in result.attempts
+    )
+
+
+def test_monthly_escalation_never_applies_to_a_hard_failure(table):
+    """A large invalid-account invoice still gets zero retries, monthly or not."""
+    rules = table.global_rules
+    result = plan(make_payment("invalid-account", amount_cents=49900), table=table)
+    assert result.retry_count == 0
+    assert result.write_off_at == FROZEN + timedelta(days=rules.write_off_after_days)
+
+
+def test_monthly_reasoning_is_visible_to_a_human(table):
+    result = plan(make_payment("insufficient-funds", amount_cents=34900), table=table)
+    assert any("monthly" in line.lower() for line in result.decision_trace)
+    assert "monthly" in result.reasoning.lower()
+
+
+# --- the split offer -----------------------------------------------------------
+
+
+def test_split_offer_is_scheduled_after_the_last_retry(table):
+    """Offering instalments before the full amount has failed reads as giving up."""
+    result = plan(make_payment("insufficient-funds"), table=table)
+    splits = [
+        a for a in result.scheduled_attempts if a.action is ActionType.OFFER_SPLIT
+    ]
+    assert len(splits) == 1
+    retries = [a for a in result.scheduled_attempts if a.action is ActionType.RETRY]
+    assert retries
+    assert splits[0].scheduled_for > max(a.scheduled_for for a in retries)
+
+
+def test_split_offer_is_suppressed_when_no_retry_was_scheduled(table):
+    """An exhausted retry budget leaves nothing for the offer to follow."""
+    rules = table.global_rules
+    customer = CustomerContext(
+        customer_id="cus_01HX0001",
+        retries_in_window=rules.customer_max_retries_in_window,
+    )
+    result = plan(make_payment("insufficient-funds"), customer=customer, table=table)
+    assert not [
+        a for a in result.scheduled_attempts if a.action is ActionType.OFFER_SPLIT
+    ]
+    skipped = [a for a in result.skipped_attempts if a.action is ActionType.OFFER_SPLIT]
+    assert skipped and "no retries" in (skipped[0].note or "")
+
+
+def test_split_offer_only_belongs_to_insufficient_funds(table):
+    """Splitting a closed account or a revoked mandate is nonsense."""
+    for code in ("invalid-account", "authority-cancelled", "payment-stopped", "technical-error"):
+        result = plan(make_payment(code), table=table)
+        assert not [
+            a for a in result.attempts if a.action is ActionType.OFFER_SPLIT
+        ], code
+
+
+def test_split_halves_are_integer_cents_that_add_back_up():
+    for amount in (1, 2, 24900, 34901, 999_999):
+        first, second = split_halves(amount)
+        assert isinstance(first, int) and isinstance(second, int)
+        assert first + second == amount
+        assert first >= second
 
 
 # --- shape and ordering --------------------------------------------------------

@@ -46,27 +46,59 @@ curl -X POST localhost:8000/api/v1/sim/seed-demo
 curl -X POST localhost:8000/api/v1/sim/fast-forward -d '{"seconds": 259200}'
 ```
 
+### Running it against the real Pinch sandbox
+
+Set `PINCH_MODE=live` with credentials in `backend/.env.local` (leave
+`PINCH_API_BASE` on `/test/`) and the same loop runs against Pinch itself. The
+sandbox dishonours a payment with whatever code you name, because the code goes
+in the description prefixed with `#` — see
+[`docs/pinch-sandbox-verification.md`](docs/pinch-sandbox-verification.md).
+
+```bash
+# a real payment in the Pinch test environment, forced to fail this way
+curl -X POST localhost:8000/api/v1/pinch/test-payments \
+  -H 'content-type: application/json' \
+  -d '{"amount_cents": 24900, "raw_code": "insufficient-funds"}'
+
+# jump past tonight's processing run — the Time-Travel header goes with it
+curl -X POST "localhost:8000/ui/fast-forward?seconds=86400"
+
+# pull the dishonour in, classify it, act on it (the background poller
+# does this every 15s in live mode; this is the manual version)
+curl -X POST localhost:8000/api/v1/pinch/poll \
+  -H 'content-type: application/json' -d '{}'
+```
+
+Both endpoints work in mock mode too, driving the simulator instead — so the
+demo sequence rehearsed on a laptop is the sequence run against the sandbox.
+
 ---
 
 ## Architecture
 
 ```
-Pinch webhook ──► /webhooks/pinch ──► ledger (idempotent on event_id)
-                                          │
-                                          ▼
+Pinch  ──► /webhooks/pinch ──┐
+           (push, needs a    │
+            public URL)      ├──► ledger (idempotent on event_id)
+       ──► GET /events    ───┘         │
+           (poll, always works)        ▼
                                    classifier  ── strategies.yaml
                                           │        (failure class + reasoning)
                                           ▼
-                                    scheduler ── clock.now()
+                                    scheduler ── clock.now() + AU business days
                                           │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                     ▼                     ▼
-                 retry              outbox message        human escalation
-              (via Pinch)          (fake inbox in UI)      (dashboard flag)
+              ┌──────────────┬────────────┼────────────┬──────────────┐
+              ▼              ▼            ▼            ▼              ▼
+           retry       outbox message  split offer   human      write-off
+        (via Pinch)   (fake inbox)    (instalments) escalation  (horizon)
 ```
 
-The simulator sits in front of the Pinch client in mock mode and produces dishonours
-on demand, with a compressible settlement delay.
+Ingest accepts the same event from either route: both insert into
+`webhook_events` first and let the unique index reject the duplicate, so
+running webhooks and polling at once is safe rather than double-counted.
+
+The simulator sits in front of the Pinch client in mock mode and produces
+dishonours on demand, with a compressible settlement delay.
 
 ### Key documents
 
@@ -74,6 +106,7 @@ on demand, with a compressible settlement delay.
 |---|---|
 | `docs/CONTRACT.md` | **Read first.** API shapes, enums, money rules. The interface both halves build against. |
 | `backend/app/services/strategies.yaml` | The recovery strategy table. This is the product. |
+| `docs/pinch-sandbox-verification.md` | How the sandbox is made to produce a specific dishonour code, and how time travel is driven. |
 
 ---
 
@@ -87,6 +120,27 @@ on demand, with a compressible settlement delay.
    not the code. A payment without reasoning is an incomplete feature.
 5. **Hard failures are never retried.** Invalid account, cancelled authority, stopped
    payment — zero retries, always. This rule is the difference between this and a cron job.
+6. **No retry is scheduled on a day the banks are shut.** Weekends and AU public
+   holidays roll forward to the next business day, so the date on screen and the
+   date the debit is presented are the same date. `app/core/holidays.py`.
+
+---
+
+## What the engine actually decides
+
+| Failure | When it retries | What else happens |
+|---|---|---|
+| Insufficient funds | Next payday (Thu/Fri, or the customer's observed one), then the following payday. At a monthly-sized amount, attempt 3 steps to their next billing date instead of a third weekly try. | Soft notice on day one; an offer to split the balance in two if both payday attempts come back short. |
+| Technical / temporary | Within 24h, silently. | Nothing — telling a customer about a bank outage manufactures churn. |
+| Invalid account | Never. | Details capture by email, escalating to SMS at 48h and a human at 96h. |
+| Authority cancelled | Never. | Save offer, and the account owner is told. This is churn, not billing. |
+| Payment stopped | Never. | A human, immediately. Chasing a stop order invites a complaint. |
+| Blocked by bank | Once, at 48h. | Then details capture. Pinch marks this non-retryable; we differ by exactly one attempt and say so in the reasoning. |
+
+Across all of them: a retry budget per *customer* rather than per invoice, at
+most one customer message per 24h on any channel, and a write-off horizon
+(21 days, or 35 for a ladder that steps out to a monthly date) after which the
+file closes rather than accruing dishonour fees.
 
 ---
 

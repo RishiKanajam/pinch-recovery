@@ -53,6 +53,21 @@ class GlobalRules:
             int(d) for d in raw.get("default_payday_weekdays", [3, 4])
         ]
         self.write_off_after_days: int = int(raw.get("write_off_after_days", 21))
+        # A debit this size or larger reads as a monthly bill rather than a
+        # weekly or fortnightly service — see `looks_monthly` in the engine.
+        self.monthly_payer_min_cents: int = int(
+            raw.get("monthly_payer_min_cents", 15000)
+        )
+        # Which retry stops following the weekly payday rhythm and steps to the
+        # customer's next equivalent billing date instead.
+        self.monthly_escalation_attempt: int = int(
+            raw.get("monthly_escalation_attempt", 3)
+        )
+        # The horizon for a payment whose ladder steps out to a monthly date.
+        # Only applied when that attempt is actually scheduled.
+        self.monthly_payer_write_off_days: int = int(
+            raw.get("monthly_payer_write_off_days", 35)
+        )
 
 
 class StrategyTable:

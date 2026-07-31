@@ -65,10 +65,25 @@ class Settings(BaseSettings):
     ENABLE_POLLER: bool = True
     POLLER_INTERVAL_SECONDS: float = 2.0
 
+    # How often that poller asks Pinch for new events when PINCH_MODE=live.
+    # Slower than the tick because it is an outbound HTTP call, not a database
+    # read — a dishonour appearing within fifteen seconds is instant to a
+    # judge, and polling every two would be rude to somebody else's API.
+    PINCH_POLL_SECONDS: float = 15.0
+
     @property
     def targets_live_money(self) -> bool:
         """True when PINCH_API_BASE points at the real-money environment."""
         return "/live" in self.PINCH_API_BASE
+
+    @property
+    def pinch_credentials_present(self) -> bool:
+        """Whether a live call could authenticate at all.
+
+        Checked before any live request so an unset credential surfaces as one
+        legible message rather than a stack trace on every poller tick.
+        """
+        return bool(self.PINCH_APPLICATION_ID and self.PINCH_SECRET_KEY)
 
 
 settings = Settings()

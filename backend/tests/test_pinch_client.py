@@ -50,7 +50,16 @@ def test_constructing_live_client_opens_no_connection(monkeypatch):
     assert client._client is None
 
 
-@pytest.mark.parametrize("method", ["retry_payment", "update_payment_method"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "retry_payment",
+        "update_payment_method",
+        "create_test_payment",
+        "list_events",
+        "get_event",
+    ],
+)
 def test_implementations_share_one_signature(method):
     """Person B must not be able to tell the implementations apart."""
     mock_sig = inspect.signature(getattr(MockPinchClient, method))

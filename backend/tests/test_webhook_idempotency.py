@@ -232,3 +232,50 @@ def test_raw_payload_is_stored_verbatim(client, db_session, customer, frozen_clo
     stored = db_session.execute(select(WebhookEvent)).scalar_one()
     assert stored.event_id == EVENT_ID
     assert stored.payload == event
+
+
+# --- late settlements against a closed file ------------------------------------
+
+
+def test_a_dishonour_after_write_off_does_not_reopen_the_payment(client, db_session, customer):
+    """The bank's answer to a question asked before the file closed.
+
+    Reopening leaves a payment with a live status and a dead ladder: the
+    write-off has already fired and cannot fire again, so it sits on the
+    dashboard with no scheduled attempts and no end state at all.
+    """
+    envelope = dishonour_event("evt_late_01", "pay_late_01", customer.id)
+    assert client.post(WEBHOOK_URL, json=envelope).status_code == 200
+
+    payment = db_session.get(Payment, "pay_late_01")
+    payment.status = "written_off"
+    db_session.commit()
+
+    late = dishonour_event("evt_late_02", "pay_late_01", customer.id)
+    assert client.post(WEBHOOK_URL, json=late).status_code == 200
+
+    db_session.refresh(payment)
+    assert payment.status == "written_off"
+
+
+def test_a_stale_dishonour_does_not_walk_back_a_recovery(client, db_session, customer):
+    """The customer fixed their details and the new account cleared.
+
+    A dishonour that lands afterwards was presented against the old account,
+    so it is not evidence the payment failed — and letting it through would
+    walk the recovered counter backwards on a payment that is genuinely paid.
+    """
+    envelope = dishonour_event("evt_stale_01", "pay_stale_01", customer.id, "invalid-account")
+    assert client.post(WEBHOOK_URL, json=envelope).status_code == 200
+
+    payment = db_session.get(Payment, "pay_stale_01")
+    payment.status = "recovered"
+    payment.recovered_at = clock.now()
+    db_session.commit()
+
+    stale = dishonour_event("evt_stale_02", "pay_stale_01", customer.id, "invalid-account")
+    assert client.post(WEBHOOK_URL, json=stale).status_code == 200
+
+    db_session.refresh(payment)
+    assert payment.status == "recovered"
+    assert payment.recovered_at is not None
